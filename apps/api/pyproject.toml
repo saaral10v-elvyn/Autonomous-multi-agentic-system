@@ -4,10 +4,13 @@ version = "0.1.0"
 description = "Forge API and worker scaffold"
 requires-python = ">=3.12"
 dependencies = [
+  "argon2-cffi>=23.1,<26",
   "alembic>=1.13,<2",
   "arq>=0.26,<1",
   "asyncpg>=0.29,<1",
+  "cryptography>=43,<52",
   "fastapi>=0.115,<1",
+  "litellm>=1.108.2,<2",
   "pydantic-settings>=2.6,<3",
   "sqlalchemy[asyncio]>=2.0,<3",
   "structlog>=24.4,<26",

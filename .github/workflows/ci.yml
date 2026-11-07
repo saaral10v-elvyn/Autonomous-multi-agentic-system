@@ -5,6 +5,33 @@ on:
 jobs:
   api:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+          POSTGRES_DB: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forge"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://forge:forge@localhost:5432/forge
+      MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      WEB_ORIGIN: http://localhost:3000
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -15,6 +42,7 @@ jobs:
       - run: uv sync --directory apps/api --all-groups
       - run: uv run --directory apps/api ruff check .
       - run: uv run --directory apps/api mypy app
+      - run: uv run --directory apps/api alembic upgrade head
       - run: uv run --directory apps/api pytest
   web:
     runs-on: ubuntu-latest
