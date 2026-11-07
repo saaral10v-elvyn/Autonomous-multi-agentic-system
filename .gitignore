@@ -1,0 +1,14 @@
+.env
+.venv/
+**/.uv-cache/
+**/.corepack-cache/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.next/
+.run/
+node_modules/
+coverage/
+*.py[cod]
+*.tsbuildinfo
