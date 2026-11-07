@@ -1,6 +1,6 @@
 # Forge
 
-Forge is a SaaS where AI agents take a user's idea to a live deployed web app with configurable human-in-the-loop. This repository currently contains the M0 scaffold.
+Forge is a SaaS where AI agents take a user's idea to a live deployed web app with configurable human-in-the-loop. This repository contains the M1 scaffold for account access, encrypted provider credentials, and the LLM gateway.
 
 ## Prerequisites
 
@@ -16,6 +16,14 @@ Copy `.env.example` to `.env`, then run:
 docker compose -f infra/docker-compose.yml up -d
 ```
 
+Before starting the API, generate a 32-byte AES-256 master key and paste the output into `MASTER_KEY` in `.env`:
+
+```sh
+python -c "import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+```
+
+Keep this key outside version control. It encrypts provider credentials and signs session cookies; losing it makes stored provider keys unreadable.
+
 ## API
 
 ```sh
@@ -23,6 +31,9 @@ cd apps/api
 uv sync --all-groups
 uv run uvicorn app.main:app --reload
 ```
+
+M1 authentication routes are under `/api/v1`; mutating requests must have the configured `WEB_ORIGIN` as their `Origin` header. Browser requests from the web app set this automatically.
+Session cookies contain a signed per-user version; logout increments the stored version so previously issued cookies are rejected on subsequent requests.
 
 Health check: `http://localhost:8000/healthz`.
 

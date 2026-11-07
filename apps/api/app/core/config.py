@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +17,11 @@ class Settings(BaseSettings):
     web_origin: str = "http://localhost:3000"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    master_key: SecretStr | None = None
+    cookie_secure: bool = False
+    session_max_age_seconds: int = 43_200
+    llm_max_retries: int = 3
+    llm_retry_base_seconds: float = 0.25
 
 
 @lru_cache
