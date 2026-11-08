@@ -4,7 +4,9 @@ from fastapi import APIRouter
 
 from app.api.v1.auth import router as auth_router
 from app.api.v1.provider_keys import router as provider_keys_router
+from app.api.v1.runs import router as runs_router
 
 router = APIRouter()
 router.include_router(auth_router)
 router.include_router(provider_keys_router)
+router.include_router(runs_router)

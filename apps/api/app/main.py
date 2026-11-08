@@ -11,11 +11,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app.api.v1.router import router as v1_router
+from app.api.v1.websockets import router as websocket_router
 from app.core.config import get_settings
 from app.core.crypto import decode_master_key
 from app.core.db import engine
 from app.core.logging import configure_logging
 from app.core.security import OriginCSRFMiddleware
+from app.events.redis import close_redis
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -28,11 +30,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info("api.started")
     yield
     await engine.dispose()
+    await close_redis()
     logger.info("api.stopped")
 
 
 app = FastAPI(title="Forge API", version="0.1.0", lifespan=lifespan)
 app.include_router(v1_router, prefix="/api/v1")
+app.include_router(websocket_router)
 app.add_middleware(OriginCSRFMiddleware)
 app.add_middleware(
     CORSMiddleware,
