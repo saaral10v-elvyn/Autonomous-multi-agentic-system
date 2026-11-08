@@ -17,6 +17,24 @@ export type ProviderTest = {
   tokens_out: number;
   cost_usd: string;
 };
+export type AutonomyLevel = "step_by_step" | "milestones" | "autopilot";
+export type Run = {
+  id: string;
+  project_id: string;
+  idea: string;
+  autonomy_level: AutonomyLevel;
+  budget_usd: string;
+  status: string;
+  created_at: string;
+};
+export type RunEvent = {
+  id: string;
+  run_id: string;
+  seq: number;
+  type: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_URL}/api/v1${path}`, {
@@ -44,4 +62,8 @@ export const api = {
   addProviderKey: (provider: Provider, label: string, api_key: string) => request<ProviderKey>("/provider-keys", { method: "POST", body: JSON.stringify({ provider, label, api_key }) }),
   testProviderKey: (id: string) => request<ProviderTest>(`/provider-keys/${id}/test`, { method: "POST" }),
   removeProviderKey: (id: string) => request<void>(`/provider-keys/${id}`, { method: "DELETE" }),
+  createRun: (idea: string, autonomy_level: AutonomyLevel, budget_usd: number) => request<Run>("/runs", { method: "POST", body: JSON.stringify({ idea, autonomy_level, budget_usd }) }),
+  runs: () => request<Run[]>("/runs"),
+  run: (id: string) => request<Run>(`/runs/${id}`),
+  runEvents: (id: string, afterSeq: number) => request<RunEvent[]>(`/runs/${id}/events?after_seq=${afterSeq}`),
 };
