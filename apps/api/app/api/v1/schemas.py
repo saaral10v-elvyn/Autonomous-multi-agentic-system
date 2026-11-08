@@ -3,12 +3,66 @@
 import re
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Annotated
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from app.llm.types import Provider
+
+
+class AutonomyLevel(StrEnum):
+    """User-selected autonomy preset for a run."""
+
+    STEP_BY_STEP = "step_by_step"
+    MILESTONES = "milestones"
+    AUTOPILOT = "autopilot"
+
+
+class RunCreateRequest(BaseModel):
+    """Initial run request accepted by the M2 API."""
+
+    idea: Annotated[str, Field(min_length=1, max_length=20_000)]
+    autonomy_level: AutonomyLevel
+    budget_usd: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=2)]
+
+    @field_validator("idea")
+    @classmethod
+    def validate_idea(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Idea is required.")
+        return normalized
+
+
+class RunResponse(BaseModel):
+    """Safe run representation."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    project_id: UUID
+    idea: str
+    autonomy_level: AutonomyLevel
+    status: str
+    budget_usd: Decimal
+    spent_usd: Decimal
+    created_at: datetime
+
+
+class RunEventResponse(BaseModel):
+    """Serialized durable run event."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    run_id: UUID
+    seq: int
+    type: str
+    payload: dict[str, object]
+    created_at: datetime
+
 
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
