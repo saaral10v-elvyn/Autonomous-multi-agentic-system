@@ -126,7 +126,7 @@ export default function RunPage() {
               onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
             ><option value="">Choose one</option>{question.options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select> : <div className="space-y-1">
               {question.options.map((option) => <label key={option.id} className="flex gap-2">
-                <input type="checkbox" checked={Array.isArray(answers[question.id]) && answers[question.id].includes(option.id)} onChange={(event) => {
+                <input type="checkbox" checked={Array.isArray(answers[question.id]) && (answers[question.id] as string[]).includes(option.id)} onChange={(event) => {
                   const selected = Array.isArray(answers[question.id]) ? answers[question.id] as string[] : [];
                   setAnswers((current) => ({ ...current, [question.id]: event.target.checked ? [...selected, option.id] : selected.filter((item) => item !== option.id) }));
                 }} />{option.label}
