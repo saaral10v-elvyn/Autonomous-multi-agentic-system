@@ -21,6 +21,7 @@ from app.models.run import Run
 from app.orchestrator.state import transition_run
 from app.repos.events import EventRepository
 from app.repos.questions import QuestionRepository
+from app.repos.runs import RunRepository
 from app.services.orchestration import PlanService, QuestionService, advance_run_job
 from app.services.runs import RunService
 from tests.conftest import WEB_ORIGIN
