@@ -19,6 +19,18 @@ WEB_DIR = ROOT / "apps" / "web"
 RUN_DIR = ROOT / ".run"
 sys.path.insert(0, str(API_DIR))
 
+API_PORT = int(os.environ.get("FORGE_SMOKE_API_PORT", "8000"))
+WEB_PORT = int(os.environ.get("FORGE_SMOKE_WEB_PORT", "3000"))
+POSTGRES_PORT = int(os.environ.get("FORGE_SMOKE_POSTGRES_PORT", "15432"))
+REDIS_PORT = int(os.environ.get("FORGE_SMOKE_REDIS_PORT", "16379"))
+os.environ.setdefault(
+    "DATABASE_URL",
+    f"postgresql+asyncpg://forge:forge@127.0.0.1:{POSTGRES_PORT}/forge",
+)
+os.environ.setdefault("REDIS_URL", f"redis://127.0.0.1:{REDIS_PORT}/0")
+os.environ.setdefault("WEB_ORIGIN", f"http://localhost:{WEB_PORT}")
+os.environ.setdefault("NEXT_PUBLIC_API_URL", f"http://127.0.0.1:{API_PORT}")
+
 import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -26,9 +38,9 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 from app.events.bus import EventBus
 
 
-API_URL = "http://127.0.0.1:8000"
-WEB_URL = "http://127.0.0.1:3000"
-ORIGIN = "http://localhost:3000"
+API_URL = f"http://127.0.0.1:{API_PORT}"
+WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
+ORIGIN = f"http://localhost:{WEB_PORT}"
 PASSWORD = "SmokeTestPassword-2026"
 PROCESSES: list[tuple[subprocess.Popen[bytes], Any]] = []
 
@@ -120,11 +132,24 @@ async def smoke() -> None:
     if not (ROOT / ".env").is_file():
         raise RuntimeError("Missing root .env; the API requires the configured MASTER_KEY.")
 
-    api_command = [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1"]
+    api_command = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(API_PORT),
+    ]
     worker_command = [sys.executable, "-m", "arq", "app.worker.WorkerSettings"]
     api = start_process("api", api_command, API_DIR)
     worker = start_process("worker", worker_command, API_DIR)
-    web = start_process("web", ["pnpm.cmd" if os.name == "nt" else "pnpm", "dev"], WEB_DIR)
+    web = start_process(
+        "web",
+        ["pnpm.cmd" if os.name == "nt" else "pnpm", "dev", "--", "--port", str(WEB_PORT)],
+        WEB_DIR,
+    )
 
     try:
         await wait_http(f"{API_URL}/healthz", api)
@@ -193,7 +218,7 @@ async def smoke() -> None:
             )
             assert_status(created, 201, "create run")
             run_id = created.json()["id"]
-            ws_url = f"ws://127.0.0.1:8000/ws/runs/{run_id}?after_seq=0"
+            ws_url = f"ws://127.0.0.1:{API_PORT}/ws/runs/{run_id}?after_seq=0"
             event_url = f"/api/v1/runs/{run_id}/events?after_seq=0"
 
             async with connect(
@@ -245,7 +270,7 @@ async def smoke() -> None:
             if second is None or second.seq != 2:
                 raise AssertionError("Restart probe did not receive seq=2")
 
-            ws_url_after_seq = f"ws://127.0.0.1:8000/ws/runs/{run_id}?after_seq=1"
+            ws_url_after_seq = f"ws://127.0.0.1:{API_PORT}/ws/runs/{run_id}?after_seq=1"
             async with connect(
                 ws_url_after_seq,
                 origin=ORIGIN,

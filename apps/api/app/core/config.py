@@ -1,8 +1,9 @@
 """Environment-backed application settings."""
 
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +16,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://forge:forge@localhost:5432/forge"
     redis_url: str = "redis://localhost:6379/0"
     web_origin: str = "http://localhost:3000"
+    app_env: Literal["development", "test", "production"] = "development"
+    fake_provider_enabled: bool = False
+    fake_provider_step_delay_seconds: float = 0
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     master_key: SecretStr | None = None
@@ -22,6 +26,13 @@ class Settings(BaseSettings):
     session_max_age_seconds: int = 43_200
     llm_max_retries: int = 3
     llm_retry_base_seconds: float = 0.25
+
+    @model_validator(mode="after")
+    def prevent_fake_provider_in_production(self) -> "Settings":
+        """Keep the deterministic demo provider unavailable in production settings."""
+        if self.app_env == "production" and self.fake_provider_enabled:
+            raise ValueError("FAKE_PROVIDER_ENABLED cannot be enabled in production.")
+        return self
 
 
 @lru_cache

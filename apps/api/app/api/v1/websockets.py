@@ -9,6 +9,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
+from app.agents.schemas import PlanDocument
 from app.core.config import get_settings
 from app.core.db import SessionFactory
 from app.core.security import SESSION_COOKIE, verify_session_token
@@ -18,6 +19,13 @@ from app.models.event import Event
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
 from app.repos.users import UserRepository
+from app.services.orchestration import (
+    InvalidAnswers,
+    PlanService,
+    QuestionService,
+    WorkflowConflict,
+    enqueue_advance,
+)
 
 router = APIRouter()
 
@@ -116,6 +124,20 @@ def _event_payload(event: Event) -> dict[str, object]:
     )
 
 
+def _validation_message(error: ValidationError) -> str:
+    """Return readable field and domain errors for rejected WebSocket input."""
+    messages: list[str] = []
+    for item in error.errors():
+        message = item.get("msg")
+        if not isinstance(message, str):
+            continue
+        location = item.get("loc")
+        path = ".".join(str(part) for part in location) if isinstance(location, tuple) else ""
+        cleaned = message.removeprefix("Value error, ")
+        messages.append(f"{path}: {cleaned}" if path else cleaned)
+    return "; ".join(messages) or "The submitted data is invalid."
+
+
 async def _catch_up(websocket: WebSocket, user_id: UUID, run_id: UUID, last_seq: int) -> int:
     async with SessionFactory() as session:
         high_watermark = await EventRepository(session).high_watermark(user_id, run_id)
@@ -186,12 +208,57 @@ async def run_event_stream(websocket: WebSocket, run_id: UUID, after_seq: int = 
                         }
                     )
                 else:
-                    await websocket.send_json(
-                        {
-                            "type": "not_implemented_yet",
-                            "request_type": client_message.type,
-                        }
-                    )
+                    try:
+                        if isinstance(client_message, AnswersSubmit):
+                            async with SessionFactory() as session:
+                                await QuestionService(session).submit(
+                                    user_id, run_id, client_message.answers
+                                )
+                            await enqueue_advance(user_id, run_id)
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
+                            )
+                        elif isinstance(client_message, PlanEdit):
+                            plan = PlanDocument.model_validate(client_message.plan)
+                            async with SessionFactory() as session:
+                                await PlanService(session).update(user_id, run_id, plan)
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
+                            )
+                        else:
+                            await websocket.send_json(
+                                {
+                                    "type": "not_implemented_yet",
+                                    "request_type": client_message.type,
+                                }
+                            )
+                    except ValidationError as error:
+                        message = _validation_message(error)
+                        if isinstance(client_message, PlanEdit):
+                            message = f"Plan is invalid: {message}"
+                        await websocket.send_json(
+                            {
+                                "type": "request.rejected",
+                                "request_type": client_message.type,
+                                "message": message,
+                            }
+                        )
+                    except (InvalidAnswers, WorkflowConflict) as error:
+                        await websocket.send_json(
+                            {
+                                "type": "request.rejected",
+                                "request_type": client_message.type,
+                                "message": str(error),
+                            }
+                        )
+                    except LookupError:
+                        await websocket.send_json(
+                            {
+                                "type": "request.rejected",
+                                "request_type": client_message.type,
+                                "message": "The request is invalid for the current run state.",
+                            }
+                        )
                 receive_task = asyncio.create_task(websocket.receive_text())
     except WebSocketDisconnect:
         return
