@@ -7,12 +7,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from app.agents.schemas import PlanDocument
 from app.core.config import get_settings
 from app.core.db import SessionFactory
 from app.core.security import SESSION_COOKIE, verify_session_token
+from app.core.validation import validation_message
 from app.events.bus import channel_for_run
 from app.events.redis import get_redis
 from app.models.event import Event
@@ -124,20 +125,6 @@ def _event_payload(event: Event) -> dict[str, object]:
     )
 
 
-def _validation_message(error: ValidationError) -> str:
-    """Return readable field and domain errors for rejected WebSocket input."""
-    messages: list[str] = []
-    for item in error.errors():
-        message = item.get("msg")
-        if not isinstance(message, str):
-            continue
-        location = item.get("loc")
-        path = ".".join(str(part) for part in location) if isinstance(location, tuple) else ""
-        cleaned = message.removeprefix("Value error, ")
-        messages.append(f"{path}: {cleaned}" if path else cleaned)
-    return "; ".join(messages) or "The submitted data is invalid."
-
-
 async def _catch_up(websocket: WebSocket, user_id: UUID, run_id: UUID, last_seq: int) -> int:
     async with SessionFactory() as session:
         high_watermark = await EventRepository(session).high_watermark(user_id, run_id)
@@ -233,7 +220,7 @@ async def run_event_stream(websocket: WebSocket, run_id: UUID, after_seq: int = 
                                 }
                             )
                     except ValidationError as error:
-                        message = _validation_message(error)
+                        message = validation_message(error)
                         if isinstance(client_message, PlanEdit):
                             message = f"Plan is invalid: {message}"
                         await websocket.send_json(

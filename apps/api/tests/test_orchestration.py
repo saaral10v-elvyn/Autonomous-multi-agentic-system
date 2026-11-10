@@ -422,7 +422,7 @@ def test_rest_answers_accept_each_question_type(
             {"choices": ["one", "outside-list"]},
             "invalid choices",
         ),
-        (question_item("details", "free_text"), "", "requires text"),
+        (question_item("details", "free_text"), {"details": ""}, "requires text"),
         (question_item("required", "free_text"), {}, "exactly the open question IDs"),
     ],
 )

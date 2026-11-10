@@ -20,6 +20,32 @@ def register(client: TestClient, email: str) -> None:
     assert response.status_code == 201
 
 
+def test_auth_and_provider_key_validation_do_not_echo_submitted_values(
+    api_client: TestClient,
+    test_emails: Callable[[], str],
+) -> None:
+    auth_value = "auth-validation-secret-marker"
+    auth_response = api_client.post(
+        "/api/v1/auth/signup",
+        json={"email": auth_value, "password": "safe-password-1"},
+        headers={"Origin": WEB_ORIGIN},
+    )
+    assert auth_response.status_code == 422
+    assert "Invalid request value." in auth_response.text
+    assert auth_value not in auth_response.text
+
+    register(api_client, test_emails())
+    provider_value = "provider-validation-secret-marker"
+    provider_response = api_client.post(
+        "/api/v1/provider-keys",
+        json={"provider": "openai", "label": "", "api_key": provider_value},
+        headers={"Origin": WEB_ORIGIN},
+    )
+    assert provider_response.status_code == 422
+    assert "Invalid request value." in provider_response.text
+    assert provider_value not in provider_response.text
+
+
 def test_cross_tenant_provider_key_access_fails(
     api_client: TestClient,
     test_emails: Callable[[], str],
