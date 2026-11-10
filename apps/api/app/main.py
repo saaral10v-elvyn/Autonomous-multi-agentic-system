@@ -17,6 +17,7 @@ from app.core.crypto import decode_master_key
 from app.core.db import engine
 from app.core.logging import configure_logging
 from app.core.security import OriginCSRFMiddleware
+from app.core.validation import validation_messages
 from app.events.redis import close_redis
 
 configure_logging()
@@ -48,12 +49,21 @@ app.add_middleware(
 
 
 @app.exception_handler(RequestValidationError)
-async def safe_validation_error(_: Request, error: RequestValidationError) -> JSONResponse:
+async def safe_validation_error(request: Request, error: RequestValidationError) -> JSONResponse:
     """Return validation locations without echoing submitted secret-bearing values."""
-    safe_errors = [
-        {"loc": list(item.get("loc", ())), "msg": "Invalid request value.", "type": "value_error"}
-        for item in error.errors()
-    ]
+    is_run_route = request.url.path.startswith("/api/v1/runs/")
+    safe_errors = (
+        validation_messages(error.errors())
+        if is_run_route
+        else [
+            {
+                "loc": list(item.get("loc", ())),
+                "msg": "Invalid request value.",
+                "type": "value_error",
+            }
+            for item in error.errors()
+        ]
+    )
     return JSONResponse({"detail": safe_errors}, status_code=422)
 
 

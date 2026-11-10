@@ -37,6 +37,7 @@ class Run(Base):
     idea: Mapped[str] = mapped_column(Text, nullable=False)
     autonomy_level: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="CREATED")
+    paused_from_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     budget_usd: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     spent_usd: Mapped[Decimal] = mapped_column(
         Numeric(12, 2), nullable=False, server_default=text("0")
