@@ -14,7 +14,6 @@ from app.llm.types import LLMResponse, LLMRunContext, Provider, ToolCall
 from app.repos.agents import AgentRepository
 from app.repos.runs import RunRepository
 
-
 ASK_USER_TOOL: dict[str, object] = {
     "type": "function",
     "function": {

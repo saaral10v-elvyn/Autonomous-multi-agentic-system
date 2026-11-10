@@ -5,8 +5,8 @@ from uuid import UUID
 
 from arq.connections import RedisSettings
 
-from app.core.config import get_settings
 from app.api.v1.deps import get_llm_client
+from app.core.config import get_settings
 from app.services.orchestration import advance_run_job
 
 

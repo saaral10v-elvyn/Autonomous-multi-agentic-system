@@ -4,19 +4,21 @@ import pytest
 
 from app.orchestrator.state import IllegalRunTransition, validate_transition
 
-
 LEGAL = {
     "CREATED": {"CLARIFYING", "PAUSED", "FAILED", "CANCELLED"},
     "CLARIFYING": {"AWAITING_ANSWERS", "PAUSED", "FAILED", "CANCELLED"},
     "AWAITING_ANSWERS": {"PLANNING", "PAUSED", "FAILED", "CANCELLED"},
-    "PLANNING": {
-        "AWAITING_PLAN_APPROVAL", "EXECUTING", "PAUSED", "FAILED", "CANCELLED"
-    },
+    "PLANNING": {"AWAITING_PLAN_APPROVAL", "EXECUTING", "PAUSED", "FAILED", "CANCELLED"},
     "AWAITING_PLAN_APPROVAL": {"EXECUTING", "PAUSED", "FAILED", "CANCELLED"},
     "EXECUTING": {"PAUSED", "FAILED", "CANCELLED"},
     "PAUSED": {
-        "CLARIFYING", "AWAITING_ANSWERS", "PLANNING", "AWAITING_PLAN_APPROVAL", "EXECUTING",
-        "FAILED", "CANCELLED",
+        "CLARIFYING",
+        "AWAITING_ANSWERS",
+        "PLANNING",
+        "AWAITING_PLAN_APPROVAL",
+        "EXECUTING",
+        "FAILED",
+        "CANCELLED",
     },
     "FAILED": set(),
     "CANCELLED": set(),

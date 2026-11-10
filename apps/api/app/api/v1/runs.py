@@ -16,7 +16,6 @@ from app.api.v1.schemas import (
 )
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
-from app.services.runs import RunService
 from app.services.orchestration import (
     InvalidAnswers,
     PlanService,
@@ -24,6 +23,7 @@ from app.services.orchestration import (
     WorkflowConflict,
     enqueue_advance,
 )
+from app.services.runs import RunService
 
 router = APIRouter(prefix="/runs")
 

@@ -23,13 +23,11 @@ from app.models.message import Message
 from app.models.provider_key import ProviderKey
 from app.models.question import Question
 from app.models.run import Run
-from app.repos.agents import AgentRepository
-from app.repos.events import EventRepository
+from app.orchestrator.state import IllegalRunTransition, stage_transition
 from app.repos.plans import PlanRepository
 from app.repos.provider_keys import ProviderKeyRepository
 from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
-from app.orchestrator.state import IllegalRunTransition, stage_transition
 
 
 class WorkflowConflict(ValueError):
@@ -60,7 +58,7 @@ def _provider_context(user_id: UUID, keys: list[ProviderKey]) -> tuple[Provider,
     if not keys:
         return None
     key = keys[0]
-    return Provider(str(getattr(key, "provider"))), getattr(key, "id")
+    return Provider(str(key.provider)), key.id
 
 
 async def _publish_all(bus: EventBus, events: list[Event]) -> None:

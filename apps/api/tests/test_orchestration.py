@@ -3,9 +3,8 @@
 from collections.abc import Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import select
+from fastapi.testclient import TestClient
 
 from app.agents.registry import ROLE_TEMPLATES
 from app.agents.runtime import AgentRuntime
@@ -17,7 +16,6 @@ from app.events.bus import EventBus
 from app.llm.client import LLMClient
 from app.llm.key_resolver import RepositoryProviderKeyResolver
 from app.llm.types import Provider
-from app.models.agent import Agent
 from app.models.event import Event
 from app.models.run import Run
 from app.orchestrator.state import transition_run
@@ -155,7 +153,9 @@ def test_autopilot_auto_approves_plan_and_records_event(
     assert advance(api_client, user_id, run_id, llm) == "EXECUTING"
     events = get_events(api_client, user_id, run_id)
     assert [event.type for event in events][-3:] == [
-        "plan.created", "plan.auto_approved", "run.state_changed"
+        "plan.created",
+        "plan.auto_approved",
+        "run.state_changed",
     ]
     assert events[-1].payload["plan_auto_approved"] is True
 
@@ -184,8 +184,9 @@ def test_awaiting_input_run_does_not_enqueue_another_worker_job(
     llm = make_fake_client()
 
     async def check() -> tuple[str, int, int]:
-        from app.core.config import get_settings as current_settings
         from redis.asyncio import Redis
+
+        from app.core.config import get_settings as current_settings
 
         redis = Redis.from_url(current_settings().redis_url)
         before = await redis.zcard("arq:queue")
@@ -219,6 +220,7 @@ def test_worker_restart_reuses_persisted_planner_step_without_duplicate_events(
     api_client.portal.call(prepare_planning)
     key_id = uuid5(NAMESPACE_URL, f"forge-fake:{user_id}")
     runtime = AgentRuntime(SessionFactory, EventBus())
+
     async def persist_planner_response() -> None:
         await runtime.complete(
             user_id,
@@ -229,6 +231,7 @@ def test_worker_restart_reuses_persisted_planner_step_without_duplicate_events(
             [{"role": "user", "content": "resume this plan"}],
             llm,
         )
+
     api_client.portal.call(persist_planner_response)
     count_before = sum(
         event.type == "agent.step_completed" and event.payload.get("role") == "planner"
@@ -260,17 +263,23 @@ def test_run_owned_answers_plan_and_approval_routes_reject_other_user(
     assert other_signup.status_code == 201
     headers = {"Origin": WEB_ORIGIN}
     valid_plan = make_plan()
-    assert api_client.post(
-        f"/api/v1/runs/{run_id}/answers",
-        json={"answers": {"primary_users": "decide_for_me"}},
-        headers=headers,
-    ).status_code == 404
-    assert api_client.put(
-        f"/api/v1/runs/{run_id}/plan", json={"plan": valid_plan}, headers=headers
-    ).status_code == 404
-    assert api_client.post(
-        f"/api/v1/runs/{run_id}/plan/approve", headers=headers
-    ).status_code == 404
+    assert (
+        api_client.post(
+            f"/api/v1/runs/{run_id}/answers",
+            json={"answers": {"primary_users": "decide_for_me"}},
+            headers=headers,
+        ).status_code
+        == 404
+    )
+    assert (
+        api_client.put(
+            f"/api/v1/runs/{run_id}/plan", json={"plan": valid_plan}, headers=headers
+        ).status_code
+        == 404
+    )
+    assert (
+        api_client.post(f"/api/v1/runs/{run_id}/plan/approve", headers=headers).status_code == 404
+    )
 
 
 def test_answers_rejected_in_wrong_state_and_invalid_answers_rejected(
@@ -360,9 +369,7 @@ def question_item(
     ("item", "answer"),
     [
         (
-            question_item(
-                "choice", "single_choice", [{"id": "one", "label": "One"}]
-            ),
+            question_item("choice", "single_choice", [{"id": "one", "label": "One"}]),
             "one",
         ),
         (
@@ -504,7 +511,5 @@ def test_plan_edits_reject_invalid_and_cyclic_plans_without_side_effects(
         assert rejection["request_type"] == "plan.edit"
         assert message in rejection["message"].lower()
 
-    assert api_client.get(f"/api/v1/runs/{run_id}").json()["status"] == (
-        "AWAITING_PLAN_APPROVAL"
-    )
+    assert api_client.get(f"/api/v1/runs/{run_id}").json()["status"] == ("AWAITING_PLAN_APPROVAL")
     assert event_signature(get_events(api_client, user_id, run_id)) == event_signature(before)
