@@ -35,6 +35,20 @@ export type RunEvent = {
   payload: Record<string, unknown>;
   created_at: string;
 };
+export type QuestionOption = { id: string; label: string };
+export type RunQuestion = {
+  id: string;
+  prompt: string;
+  type: "single_choice" | "multi_choice" | "free_text";
+  options: QuestionOption[];
+  allow_decide_for_me: boolean;
+};
+export type Plan = {
+  product_brief: string;
+  tech_stack: string[];
+  milestones: { id: string; title: string; description: string }[];
+  tasks: { id: string; title: string; description: string; depends_on: string[] }[];
+};
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_URL}/api/v1${path}`, {
@@ -44,10 +58,26 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
-    const message = typeof body === "object" && body !== null && "detail" in body
-      ? String(body.detail)
-      : "Request failed.";
-    throw new Error(message);
+    let detail: unknown;
+    if (typeof body === "object" && body !== null && "detail" in body) {
+      detail = body.detail;
+    }
+    if (typeof detail === "string") throw new Error(detail);
+    if (Array.isArray(detail)) {
+      const messages = detail.flatMap((item: unknown): string[] => {
+        if (typeof item !== "object" || item === null || !("msg" in item)) return [];
+        const message = typeof item.msg === "string" ? item.msg : "";
+        const location = "loc" in item && Array.isArray(item.loc)
+          ? item.loc.filter(
+              (part: unknown): part is string | number =>
+                typeof part === "string" || typeof part === "number",
+            )
+          : [];
+        return [location.length > 0 ? `${location.join(" ")}: ${message}` : message].filter(Boolean);
+      });
+      if (messages.length > 0) throw new Error(messages.join("; "));
+    }
+    throw new Error("Request failed.");
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -66,4 +96,7 @@ export const api = {
   runs: () => request<Run[]>("/runs"),
   run: (id: string) => request<Run>(`/runs/${id}`),
   runEvents: (id: string, afterSeq: number) => request<RunEvent[]>(`/runs/${id}/events?after_seq=${afterSeq}`),
+  submitRunAnswers: (id: string, answers: Record<string, unknown>) => request<Run>(`/runs/${id}/answers`, { method: "POST", body: JSON.stringify({ answers }) }),
+  updateRunPlan: (id: string, plan: Plan) => request<Plan>(`/runs/${id}/plan`, { method: "PUT", body: JSON.stringify({ plan }) }),
+  approveRunPlan: (id: string) => request<Run>(`/runs/${id}/plan/approve`, { method: "POST" }),
 };

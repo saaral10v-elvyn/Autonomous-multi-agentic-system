@@ -9,6 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+from app.agents.schemas import PlanDocument
 from app.llm.types import Provider
 
 
@@ -62,6 +63,18 @@ class RunEventResponse(BaseModel):
     type: str
     payload: dict[str, object]
     created_at: datetime
+
+
+class AnswersRequest(BaseModel):
+    """Responses keyed by the question IDs in the open question set."""
+
+    answers: dict[str, object]
+
+
+class PlanUpdateRequest(BaseModel):
+    """User-edited plan validated against the same Planner output schema."""
+
+    plan: PlanDocument
 
 
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
