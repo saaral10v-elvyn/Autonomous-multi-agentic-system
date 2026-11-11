@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { api, type Plan, type Run, type RunEvent, type RunQuestion } from "@/lib/api";
+import { api, type Approval, type ApprovalDecision, type AutonomyLevel, type Plan, type Run, type RunEvent, type RunQuestion } from "@/lib/api";
 import { useRunStream } from "@/hooks/use-run-stream";
 
 function isQuestion(value: unknown): value is RunQuestion {
@@ -21,6 +21,14 @@ function isPlan(value: unknown): value is Plan {
     Array.isArray(plan.milestones) && Array.isArray(plan.tasks);
 }
 
+function isAutonomyLevel(value: unknown): value is AutonomyLevel {
+  return value === "step_by_step" || value === "milestones" || value === "autopilot";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function eventPlan(events: RunEvent[]): Plan | null {
   for (const event of [...events].reverse()) {
     if (event.type !== "plan.created" && event.type !== "plan.updated") continue;
@@ -34,6 +42,8 @@ export default function RunPage() {
   const runId = params.id;
   const { events, connected } = useRunStream(runId);
   const [run, setRun] = useState<Run | null>(null);
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [editedPayloads, setEditedPayloads] = useState<Record<string, string>>({});
   const [answers, setAnswers] = useState<Record<string, unknown>>({});
   const [planDraft, setPlanDraft] = useState("");
   const [error, setError] = useState("");
@@ -44,6 +54,20 @@ export default function RunPage() {
       setError(reason instanceof Error ? reason.message : "Could not load run."),
     );
   }, [runId]);
+
+  useEffect(() => {
+    void api.runApprovals(runId).then(setApprovals).catch((reason: unknown) =>
+      setError(reason instanceof Error ? reason.message : "Could not load approvals."),
+    );
+  }, [runId, events]);
+
+  useEffect(() => {
+    const autonomyEvent = [...events].reverse().find((event) => event.type === "run.autonomy_changed");
+    const nextLevel = autonomyEvent?.payload.to;
+    if (run && isAutonomyLevel(nextLevel) && run.autonomy_level !== nextLevel) {
+      setRun({ ...run, autonomy_level: nextLevel });
+    }
+  }, [events, run]);
 
   const state = [...events].reverse().find((event) => event.type === "run.state_changed")?.payload.status;
   const status = typeof state === "string" ? state : run?.status ?? "Loading";
@@ -100,6 +124,42 @@ export default function RunPage() {
     }
   }
 
+  async function updateAutonomy(level: AutonomyLevel) {
+    setSaving(true);
+    setError("");
+    try {
+      setRun(await api.updateRunAutonomy(runId, level));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not update autonomy.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function decideApproval(approval: Approval, decision: ApprovalDecision) {
+    setSaving(true);
+    setError("");
+    try {
+      let edited: Record<string, unknown> | undefined;
+      if (decision === "edit") {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(editedPayloads[approval.id] ?? JSON.stringify(approval.payload));
+        } catch {
+          throw new Error("Edited payload must be valid JSON.");
+        }
+        if (!isRecord(parsed)) throw new Error("Edited payload must be a JSON object.");
+        edited = parsed;
+      }
+      await api.decideApproval(approval.id, decision, edited);
+      setApprovals(await api.runApprovals(runId));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not resolve approval.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return <main className="mx-auto max-w-4xl space-y-6 p-8">
     <Link href="/runs" className="text-sm underline">← All runs</Link>
     {error && <p role="alert" className="rounded border border-red-300 p-3 text-red-700">{error}</p>}
@@ -108,7 +168,52 @@ export default function RunPage() {
         <p className="text-sm text-slate-500">{connected ? "Live" : "Reconnecting"} · <span aria-label="Run state">{status}</span></p>
         <h1 className="text-3xl font-semibold">{run.idea}</h1>
         <p>Budget cap: ${run.budget_usd}</p>
+        <label className="flex items-center gap-3" htmlFor="autonomy-level">
+          <span className="font-medium">Autonomy</span>
+          <select
+            id="autonomy-level"
+            aria-label="Autonomy level"
+            className="rounded border p-2 text-slate-900"
+            disabled={saving}
+            value={run.autonomy_level}
+            onChange={(event) => {
+              if (isAutonomyLevel(event.target.value)) void updateAutonomy(event.target.value);
+            }}
+          >
+            <option value="step_by_step">Step-by-step</option>
+            <option value="milestones">Milestones</option>
+            <option value="autopilot">Autopilot</option>
+          </select>
+        </label>
       </header>
+      <section aria-label="Approvals queue" className="space-y-4 rounded-xl border p-5">
+        <h2 className="text-xl font-medium">Approvals</h2>
+        {approvals.length === 0 ? <p className="text-slate-600">No approval requests.</p> : approvals.map((approval) => <article key={approval.id} className="space-y-3 rounded border p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-medium">{approval.action_type}</h3>
+            <span className="rounded bg-slate-100 px-2 py-1 text-sm">{approval.risk} · {approval.status}</span>
+          </div>
+          <p>{approval.reason}</p>
+          <p className="text-sm text-slate-600">Agent: {approval.agent_id ?? "run workflow"} · Estimated cost: {approval.estimated_cost_usd ? `$${approval.estimated_cost_usd}` : "Not provided"}</p>
+          <div><h4 className="text-sm font-medium">Exact payload</h4><pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 p-3 text-sm">{JSON.stringify(approval.payload, null, 2)}</pre></div>
+          {approval.rollback_info && <div><h4 className="text-sm font-medium">Rollback</h4><pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 p-3 text-sm">{JSON.stringify(approval.rollback_info, null, 2)}</pre></div>}
+          {approval.status === "pending" && <div className="space-y-3">
+            <label className="block text-sm font-medium" htmlFor={`approval-edit-${approval.id}`}>Edit payload (JSON)</label>
+            <textarea
+              id={`approval-edit-${approval.id}`}
+              aria-label={`Edit payload for ${approval.action_type}`}
+              className="min-h-28 w-full rounded border p-3 font-mono text-sm text-slate-900"
+              value={editedPayloads[approval.id] ?? JSON.stringify(approval.payload, null, 2)}
+              onChange={(event) => setEditedPayloads((current) => ({ ...current, [approval.id]: event.target.value }))}
+            />
+            <div className="flex flex-wrap gap-3">
+              <button type="button" disabled={saving} onClick={() => void decideApproval(approval, "approve")} className="rounded bg-slate-900 px-4 py-2 text-white">Approve</button>
+              <button type="button" disabled={saving} onClick={() => void decideApproval(approval, "reject")} className="rounded border px-4 py-2">Reject</button>
+              <button type="button" disabled={saving} onClick={() => void decideApproval(approval, "edit")} className="rounded border px-4 py-2">Save edited payload</button>
+            </div>
+          </div>}
+        </article>)}
+      </section>
       {status === "AWAITING_ANSWERS" && questions.length > 0 && <section className="space-y-4 rounded-xl border p-5">
         <h2 className="text-xl font-medium">A few questions</h2>
         <form className="space-y-5" onSubmit={(event) => void submitAnswers(event)}>
