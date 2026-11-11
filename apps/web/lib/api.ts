@@ -18,6 +18,28 @@ export type ProviderTest = {
   cost_usd: string;
 };
 export type AutonomyLevel = "step_by_step" | "milestones" | "autopilot";
+export type ApprovalRisk = "read" | "sandbox_write" | "reversible_external" | "irreversible";
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "edited" | "expired";
+export type Approval = {
+  id: string;
+  run_id: string;
+  agent_id: string | null;
+  action_type: string;
+  risk: ApprovalRisk;
+  payload: Record<string, unknown>;
+  reason: string;
+  estimated_cost_usd: string | null;
+  rollback_info: Record<string, unknown> | null;
+  status: ApprovalStatus;
+  edited_payload: Record<string, unknown> | null;
+  decided_at: string | null;
+  created_at: string;
+};
+export type ApprovalDecision = "approve" | "reject" | "edit";
+export type ApprovalDecisionResult = {
+  approval: Approval;
+  feedback: Record<string, unknown> | null;
+};
 export type Run = {
   id: string;
   project_id: string;
@@ -99,4 +121,7 @@ export const api = {
   submitRunAnswers: (id: string, answers: Record<string, unknown>) => request<Run>(`/runs/${id}/answers`, { method: "POST", body: JSON.stringify({ answers }) }),
   updateRunPlan: (id: string, plan: Plan) => request<Plan>(`/runs/${id}/plan`, { method: "PUT", body: JSON.stringify({ plan }) }),
   approveRunPlan: (id: string) => request<Run>(`/runs/${id}/plan/approve`, { method: "POST" }),
+  runApprovals: (id: string) => request<Approval[]>(`/runs/${id}/approvals`),
+  decideApproval: (id: string, decision: ApprovalDecision, edited_payload?: Record<string, unknown>) => request<ApprovalDecisionResult>(`/approvals/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, edited_payload }) }),
+  updateRunAutonomy: (id: string, autonomy_level: AutonomyLevel) => request<Run>(`/runs/${id}/autonomy`, { method: "PATCH", body: JSON.stringify({ autonomy_level }) }),
 };
