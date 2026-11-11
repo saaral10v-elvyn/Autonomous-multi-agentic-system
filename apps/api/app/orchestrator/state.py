@@ -17,6 +17,7 @@ ACTIVE_STATES = {
     "PLANNING",
     "AWAITING_PLAN_APPROVAL",
     "EXECUTING",
+    "AWAITING_APPROVAL",
 }
 LEGAL_TRANSITIONS: dict[str, set[str]] = {
     "CREATED": {"CLARIFYING"},
@@ -24,7 +25,8 @@ LEGAL_TRANSITIONS: dict[str, set[str]] = {
     "AWAITING_ANSWERS": {"PLANNING"},
     "PLANNING": {"AWAITING_PLAN_APPROVAL", "EXECUTING"},
     "AWAITING_PLAN_APPROVAL": {"EXECUTING"},
-    "EXECUTING": set(),
+    "EXECUTING": {"AWAITING_APPROVAL"},
+    "AWAITING_APPROVAL": {"EXECUTING"},
     "PAUSED": set(),
     "FAILED": set(),
     "CANCELLED": set(),
@@ -47,6 +49,7 @@ def validate_transition(current: str, target: str) -> None:
         "PLANNING",
         "AWAITING_PLAN_APPROVAL",
         "EXECUTING",
+        "AWAITING_APPROVAL",
     }:
         return
     if target not in LEGAL_TRANSITIONS.get(current, set()):

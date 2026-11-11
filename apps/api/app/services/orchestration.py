@@ -1,4 +1,4 @@
-"""M3 Clarifier/Planner orchestration and shared human-input services."""
+"""Run orchestration, human-input flows, and durable approval resumption."""
 
 import json
 from collections.abc import Mapping, Sequence
@@ -8,15 +8,17 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.registry import ROLE_TEMPLATES
+from app.agents.demo_tools import agent_tool_registry
+from app.agents.registry import ROLE_TEMPLATES, RoleTemplate
 from app.agents.runtime import AgentRuntime, BudgetExceededError
 from app.agents.schemas import PlanDocument, QuestionSet
 from app.core.config import get_settings
 from app.core.db import SessionFactory
 from app.events.bus import EventBus
+from app.gate.engine import GateDecision, RiskClass, WorkflowGate, decide
 from app.llm.client import LLMClient
 from app.llm.errors import LLMRequestError, ProviderKeyUnavailable
-from app.llm.types import Provider
+from app.llm.types import ModelTier, Provider
 from app.models.agent import Agent
 from app.models.event import Event
 from app.models.message import Message
@@ -24,10 +26,14 @@ from app.models.provider_key import ProviderKey
 from app.models.question import Question
 from app.models.run import Run
 from app.orchestrator.state import IllegalRunTransition, stage_transition
+from app.repos.agents import AgentRepository
+from app.repos.approvals import ApprovalRepository
 from app.repos.plans import PlanRepository
 from app.repos.provider_keys import ProviderKeyRepository
 from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
+from app.repos.tool_executions import ToolExecutionRepository
+from app.services.tools import ToolExecutionPipeline, ToolExecutionResult
 
 
 class WorkflowConflict(ValueError):
@@ -153,6 +159,7 @@ class RunOrchestrator:
         self, user_id: UUID, run_id: UUID, idea: str, provider: Provider, key_id: UUID
     ) -> None:
         template = ROLE_TEMPLATES["clarifier"]
+        tool_registry = agent_tool_registry()
         try:
             response = await self._runtime.complete(
                 user_id,
@@ -165,10 +172,27 @@ class RunOrchestrator:
                     {"role": "user", "content": idea},
                 ],
                 self._llm,
+                tool_registry=tool_registry,
             )
             if len(response.tool_calls) != 1 or response.tool_calls[0].name != "ask_user":
                 raise ValueError("Clarifier did not return the ask_user tool.")
-            questions = QuestionSet.model_validate(response.tool_calls[0].arguments)
+            tool_call = response.tool_calls[0]
+            questions = QuestionSet.model_validate(tool_call.arguments)
+            async with SessionFactory() as session:
+                agent = await AgentRepository(session).get_for_role(user_id, run_id, template.name)
+            if agent is None:
+                raise LookupError("Clarifier agent was not found.")
+            tool_result = await self._runtime.execute_tool_call(
+                user_id,
+                run_id,
+                agent.id,
+                tool_call,
+                tool_registry,
+                reason="Present the clarifying questions required to prepare a plan.",
+            )
+            if tool_result.status != "completed" or tool_result.output is None:
+                return
+            questions = QuestionSet.model_validate(tool_result.output)
         except BudgetExceededError:
             await _mark_failed(user_id, run_id, "Run budget exhausted before the next LLM call.")
             return
@@ -260,7 +284,12 @@ class RunOrchestrator:
                 payload={"artifact_id": str(saved.id), "plan": plan.model_dump(mode="json")},
             )
             pending = [plan_event]
-            if run.autonomy_level == "autopilot":
+            plan_decision = decide(
+                run.autonomy_level,
+                RiskClass.READ,
+                {"gate": WorkflowGate.PLAN_APPROVAL.value},
+            )
+            if plan_decision is GateDecision.AUTO:
                 auto_event = await bus.persist(
                     session,
                     user_id,
@@ -449,3 +478,124 @@ async def advance_run_job(user_id: UUID, run_id: UUID, llm_client: LLMClient) ->
         return await RunOrchestrator(llm_client).advance_until_input(user_id, run_id)
     except (IllegalRunTransition, LookupError):
         raise
+
+
+async def resume_approval_job(
+    user_id: UUID,
+    run_id: UUID,
+    approval_id: UUID,
+    llm_client: LLMClient,
+    event_bus: EventBus | None = None,
+) -> ToolExecutionResult:
+    """Resume a resolved tool and ask the requesting agent to replan on rejection."""
+    bus = event_bus or EventBus()
+    result = await ToolExecutionPipeline(
+        SessionFactory, agent_tool_registry(), bus
+    ).resume_approval(user_id, run_id, approval_id)
+    if result.output is not None and result.output.get("status") == "rejected":
+        await _replan_after_rejection(user_id, run_id, approval_id, result, llm_client, bus)
+    return result
+
+
+async def _replan_after_rejection(
+    user_id: UUID,
+    run_id: UUID,
+    approval_id: UUID,
+    tool_result: ToolExecutionResult,
+    llm_client: LLMClient,
+    event_bus: EventBus,
+) -> None:
+    """Persist one bounded follow-up LLM step with structured rejection feedback."""
+    if tool_result.output is None:
+        return
+    async with SessionFactory() as session:
+        approval = await ApprovalRepository(session).get_for_user(user_id, approval_id)
+        run = await RunRepository(session).get_for_user(user_id, run_id)
+        if approval is None or run is None or approval.agent_id is None:
+            return
+        agent = await AgentRepository(session).get_for_id(user_id, approval.agent_id)
+        if agent is None:
+            return
+        steps = await AgentRepository(session).list_steps_for_agent(user_id, agent.id)
+        if not steps or steps[-1].kind == "llm":
+            return
+        llm_step = next((step for step in reversed(steps) if step.kind == "llm"), None)
+        if llm_step is None:
+            return
+        execution = (
+            await ToolExecutionRepository(session).get_for_key(
+                user_id, run_id, approval.idempotency_key
+            )
+            if approval.idempotency_key is not None
+            else None
+        )
+        if execution is None:
+            return
+        raw_messages = llm_step.payload.get("input_messages")
+        raw_calls = llm_step.payload.get("tool_calls")
+        if not isinstance(raw_messages, list) or not isinstance(raw_calls, list):
+            return
+        messages = [dict(message) for message in raw_messages if isinstance(message, dict)]
+        call_id = next(
+            (
+                str(call.get("id"))
+                for call in raw_calls
+                if isinstance(call, dict)
+                and call.get("name") == execution.tool_name
+                and call.get("arguments") == execution.input_payload
+            ),
+            None,
+        )
+        if call_id is None:
+            return
+        config = agent.config
+        raw_allowlist = config.get("tool_allowlist", [])
+        tool_allowlist = (
+            tuple(item for item in raw_allowlist if isinstance(item, str))
+            if isinstance(raw_allowlist, list)
+            else ()
+        )
+        raw_max_steps = config.get("max_steps", 1)
+        template = RoleTemplate(
+            name=agent.role,
+            system_prompt=str(config.get("system_prompt", "")),
+            model_tier=ModelTier(str(config.get("model_tier", ModelTier.BALANCED.value))),
+            tool_allowlist=tool_allowlist,
+            output_schema=str(config.get("output_schema", "")),
+            max_steps=raw_max_steps if isinstance(raw_max_steps, int) else 1,
+        )
+        keys = await ProviderKeyRepository(session).list_for_user(user_id)
+    provider_context = _provider_context(user_id, keys)
+    if provider_context is None:
+        return
+    provider, provider_key_id = provider_context
+    feedback_message = {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": execution.tool_name,
+                    "arguments": json.dumps(execution.input_payload),
+                },
+            }
+        ],
+    }
+    tool_message = {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": json.dumps(tool_result.output),
+    }
+    messages.extend([feedback_message, tool_message])
+    await AgentRuntime(SessionFactory, event_bus).complete(
+        user_id,
+        run_id,
+        provider,
+        provider_key_id,
+        template,
+        messages,
+        llm_client,
+        tool_registry=agent_tool_registry(),
+        force_new=True,
+    )
