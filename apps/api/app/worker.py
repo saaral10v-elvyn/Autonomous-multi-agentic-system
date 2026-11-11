@@ -7,7 +7,7 @@ from arq.connections import RedisSettings
 
 from app.api.v1.deps import get_llm_client
 from app.core.config import get_settings
-from app.services.orchestration import advance_run_job
+from app.services.orchestration import advance_run_job, resume_approval_job
 
 
 async def noop_job(_: Any, message: str = "") -> str:
@@ -20,8 +20,16 @@ async def advance_run(_: Any, user_id: str, run_id: str) -> str:
     return await advance_run_job(UUID(user_id), UUID(run_id), get_llm_client())
 
 
+async def resume_approval(_: Any, user_id: str, run_id: str, approval_id: str) -> str:
+    """Resume the durable tool action linked to a resolved approval."""
+    result = await resume_approval_job(
+        UUID(user_id), UUID(run_id), UUID(approval_id), get_llm_client()
+    )
+    return result.status
+
+
 class WorkerSettings:
     """Arq worker configuration."""
 
-    functions = [noop_job, advance_run]
+    functions = [noop_job, advance_run, resume_approval]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

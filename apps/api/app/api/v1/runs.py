@@ -9,6 +9,8 @@ from pydantic import ValidationError
 from app.api.v1.deps import CurrentUser, DbSession
 from app.api.v1.schemas import (
     AnswersRequest,
+    ApprovalResponse,
+    AutonomyUpdateRequest,
     PlanUpdateRequest,
     RunCreateRequest,
     RunEventResponse,
@@ -16,6 +18,7 @@ from app.api.v1.schemas import (
 )
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
+from app.services.approvals import ApprovalConflict, ApprovalService
 from app.services.orchestration import (
     InvalidAnswers,
     PlanService,
@@ -67,6 +70,35 @@ async def get_run_events(
     if await EventRepository(session).high_watermark(user.id, run_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
     return [RunEventResponse.model_validate(event) for event in events]
+
+
+@router.get("/{run_id}/approvals", response_model=list[ApprovalResponse])
+async def list_run_approvals(
+    run_id: UUID, user: CurrentUser, session: DbSession
+) -> list[ApprovalResponse]:
+    try:
+        approvals = await ApprovalService(session).list_for_run(user.id, run_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Run not found.") from None
+    return [ApprovalResponse.model_validate(approval) for approval in approvals]
+
+
+@router.patch("/{run_id}/autonomy", response_model=RunResponse)
+async def update_run_autonomy(
+    run_id: UUID,
+    payload: AutonomyUpdateRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> RunResponse:
+    try:
+        run = await ApprovalService(session).update_autonomy(
+            user.id, run_id, payload.autonomy_level.value
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Run not found.") from None
+    except ApprovalConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    return RunResponse.model_validate(run)
 
 
 @router.post("/{run_id}/answers", response_model=RunResponse)

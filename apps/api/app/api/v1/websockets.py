@@ -20,11 +20,10 @@ from app.models.event import Event
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
 from app.repos.users import UserRepository
+from app.services.approvals import ApprovalService, enqueue_approval_resume
 from app.services.orchestration import (
-    InvalidAnswers,
     PlanService,
     QuestionService,
-    WorkflowConflict,
     enqueue_advance,
 )
 
@@ -212,6 +211,22 @@ async def run_event_stream(websocket: WebSocket, run_id: UUID, after_seq: int = 
                             await websocket.send_json(
                                 {"type": "request.accepted", "request_type": client_message.type}
                             )
+                        elif isinstance(client_message, ApprovalDecide):
+                            async with SessionFactory() as session:
+                                approval, feedback = await ApprovalService(session).decide(
+                                    user_id,
+                                    client_message.approval_id,
+                                    client_message.decision,
+                                    edited_payload=client_message.edited_payload,
+                                )
+                            await enqueue_approval_resume(user_id, approval.run_id, approval.id)
+                            await websocket.send_json(
+                                {
+                                    "type": "request.accepted",
+                                    "request_type": client_message.type,
+                                    "feedback": feedback,
+                                }
+                            )
                         else:
                             await websocket.send_json(
                                 {
@@ -230,7 +245,7 @@ async def run_event_stream(websocket: WebSocket, run_id: UUID, after_seq: int = 
                                 "message": message,
                             }
                         )
-                    except (InvalidAnswers, WorkflowConflict) as error:
+                    except ValueError as error:
                         await websocket.send_json(
                             {
                                 "type": "request.rejected",

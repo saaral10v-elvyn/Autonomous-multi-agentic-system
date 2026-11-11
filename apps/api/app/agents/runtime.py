@@ -7,12 +7,14 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.registry import RoleTemplate
+from app.agents.tools import ToolRegistry
 from app.core.config import get_settings
 from app.events.bus import EventBus
 from app.llm.client import LLMClient
 from app.llm.types import LLMResponse, LLMRunContext, Provider, ToolCall
 from app.repos.agents import AgentRepository
 from app.repos.runs import RunRepository
+from app.services.tools import ToolExecutionPipeline, ToolExecutionResult
 
 ASK_USER_TOOL: dict[str, object] = {
     "type": "function",
@@ -55,6 +57,9 @@ class AgentRuntime:
         template: RoleTemplate,
         messages: list[dict[str, object]],
         llm_client: LLMClient,
+        *,
+        tool_registry: ToolRegistry | None = None,
+        force_new: bool = False,
     ) -> LLMResponse:
         """Return the saved step if present, otherwise call, persist, then return it."""
         async with self._sessions() as session:
@@ -67,11 +72,19 @@ class AgentRuntime:
             if agent is None:
                 raise LookupError("Run not found.")
             steps = await AgentRepository(session).list_steps_for_agent(user_id, agent.id)
-            if steps:
-                return _response_from_payload(steps[-1].payload)
+            last_llm_step = next((step for step in reversed(steps) if step.kind == "llm"), None)
+            if last_llm_step is not None and not force_new:
+                return _response_from_payload(last_llm_step.payload)
             if run.spent_usd >= run.budget_usd:
                 raise BudgetExceededError
-            tools = [ASK_USER_TOOL] if "ask_user" in template.tool_allowlist else None
+            if tool_registry is not None:
+                tools = tool_registry.schemas(template.tool_allowlist) or None
+            elif template.tool_allowlist == ("ask_user",):
+                tools = [ASK_USER_TOOL]
+            elif template.tool_allowlist:
+                raise ValueError("An executable tool registry is required for this role.")
+            else:
+                tools = None
             context = LLMRunContext(
                 user_id=user_id,
                 provider=provider,
@@ -85,7 +98,7 @@ class AgentRuntime:
                 template.model_tier,
                 context,
             )
-            payload = _payload_from_response(response)
+            payload = _payload_from_response(response, messages)
             step = await AgentRepository(session).create_step(
                 user_id,
                 agent.id,
@@ -117,6 +130,27 @@ class AgentRuntime:
             await _pause_after_persisted_step()
         return response
 
+    async def execute_tool_call(
+        self,
+        user_id: UUID,
+        run_id: UUID,
+        agent_id: UUID,
+        tool_call: ToolCall,
+        registry: ToolRegistry,
+        *,
+        reason: str,
+    ) -> ToolExecutionResult:
+        """Route every model tool call through the risk and persistence pipeline."""
+        return await ToolExecutionPipeline(self._sessions, registry, self._event_bus).execute(
+            user_id,
+            run_id,
+            agent_id,
+            tool_call.name,
+            tool_call.arguments,
+            tool_call_id=tool_call.id,
+            reason=reason,
+        )
+
 
 async def _pause_after_persisted_step() -> None:
     """Optionally pause the development fake after a durable step for restart tests."""
@@ -138,7 +172,9 @@ def _template_config(template: RoleTemplate) -> dict[str, object]:
     }
 
 
-def _payload_from_response(response: LLMResponse) -> dict[str, object]:
+def _payload_from_response(
+    response: LLMResponse, input_messages: list[dict[str, object]]
+) -> dict[str, object]:
     return {
         "provider": response.provider.value,
         "model": response.model,
@@ -150,6 +186,7 @@ def _payload_from_response(response: LLMResponse) -> dict[str, object]:
         "tokens_in": response.tokens_in,
         "tokens_out": response.tokens_out,
         "cost_usd": str(response.cost_usd),
+        "input_messages": input_messages,
     }
 
 

@@ -36,6 +36,23 @@ class AgentRepository:
             await self._session.flush()
         return agent
 
+    async def get_for_role(self, user_id: UUID, run_id: UUID, role: str) -> Agent | None:
+        """Get one agent role instance through its owning user run."""
+        result = await self._session.execute(
+            select(Agent)
+            .join(Run, Run.id == Agent.run_id)
+            .where(Run.user_id == user_id, Run.id == run_id, Agent.role == role)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_for_id(self, user_id: UUID, agent_id: UUID) -> Agent | None:
+        """Get an agent only through a run owned by the supplied user."""
+        return await self._session.scalar(
+            select(Agent)
+            .join(Run, Run.id == Agent.run_id)
+            .where(Run.user_id == user_id, Agent.id == agent_id)
+        )
+
     async def list_steps_for_agent(self, user_id: UUID, agent_id: UUID) -> list[AgentStep]:
         result = await self._session.execute(
             select(AgentStep)
