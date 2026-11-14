@@ -20,13 +20,13 @@ from app.models.event import Event
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
 from app.repos.users import UserRepository
+from app.services.approvals import ApprovalService, enqueue_approval_resume
 from app.services.orchestration import (
-    InvalidAnswers,
     PlanService,
     QuestionService,
-    WorkflowConflict,
     enqueue_advance,
 )
+from app.services.run_controls import RunControlService
 
 router = APIRouter()
 
@@ -48,7 +48,7 @@ class ApprovalDecide(BaseModel):
 class UserMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     type: Literal["user.message"]
-    content: str
+    content: str = Field(min_length=1, max_length=8000)
     agent_id: UUID | None = None
 
 
@@ -212,6 +212,55 @@ async def run_event_stream(websocket: WebSocket, run_id: UUID, after_seq: int = 
                             await websocket.send_json(
                                 {"type": "request.accepted", "request_type": client_message.type}
                             )
+                        elif isinstance(client_message, ApprovalDecide):
+                            async with SessionFactory() as session:
+                                approval, feedback = await ApprovalService(session).decide(
+                                    user_id,
+                                    client_message.approval_id,
+                                    client_message.decision,
+                                    edited_payload=client_message.edited_payload,
+                                )
+                            await enqueue_approval_resume(user_id, approval.run_id, approval.id)
+                            await websocket.send_json(
+                                {
+                                    "type": "request.accepted",
+                                    "request_type": client_message.type,
+                                    "feedback": feedback,
+                                }
+                            )
+                        elif isinstance(client_message, UserMessage):
+                            async with SessionFactory() as session:
+                                await RunControlService(session).message(
+                                    user_id,
+                                    run_id,
+                                    client_message.content,
+                                    client_message.agent_id,
+                                )
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
+                            )
+                        elif isinstance(client_message, RunControl):
+                            async with SessionFactory() as session:
+                                controls = RunControlService(session)
+                                if client_message.type == "run.pause":
+                                    await controls.pause(user_id, run_id)
+                                elif client_message.type == "run.resume":
+                                    resumed = await controls.resume(user_id, run_id)
+                                    if resumed.status != "AWAITING_APPROVAL":
+                                        await enqueue_advance(user_id, run_id)
+                                else:
+                                    await controls.cancel(user_id, run_id)
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
+                            )
+                        elif isinstance(client_message, AgentInterrupt):
+                            async with SessionFactory() as session:
+                                await RunControlService(session).interrupt(
+                                    user_id, client_message.agent_id
+                                )
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
+                            )
                         else:
                             await websocket.send_json(
                                 {
@@ -230,7 +279,7 @@ async def run_event_stream(websocket: WebSocket, run_id: UUID, after_seq: int = 
                                 "message": message,
                             }
                         )
-                    except (InvalidAnswers, WorkflowConflict) as error:
+                    except ValueError as error:
                         await websocket.send_json(
                             {
                                 "type": "request.rejected",

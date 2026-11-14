@@ -12,6 +12,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 import app.api.v1.websockets as websocket_module
 from app.core.db import SessionFactory
 from app.events.bus import EventBus
+from app.models.agent import Agent
 from app.repos.events import EventRepository
 from tests.conftest import WEB_ORIGIN
 
@@ -77,16 +78,58 @@ def test_cross_tenant_user_cannot_read_events_or_connect_to_run(
 ) -> None:
     signup(api_client, test_emails())
     run_id = create_run(api_client)
+
+    async def create_agent() -> UUID:
+        async with SessionFactory() as session:
+            agent = Agent(run_id=run_id, role="coder", config={}, status="created")
+            session.add(agent)
+            await session.commit()
+            return agent.id
+
+    agent_id = api_client.portal.call(create_agent)
     signup(api_client, test_emails())
 
     assert api_client.get(f"/api/v1/runs/{run_id}").status_code == 404
     assert api_client.get(f"/api/v1/runs/{run_id}/events").status_code == 404
+    assert api_client.get(f"/api/v1/runs/{run_id}/agents").status_code == 404
+    assert api_client.get(f"/api/v1/runs/{run_id}/tasks").status_code == 404
+    headers = {"Origin": WEB_ORIGIN}
+    assert api_client.post(f"/api/v1/runs/{run_id}/pause", headers=headers).status_code == 404
+    assert api_client.post(f"/api/v1/runs/{run_id}/resume", headers=headers).status_code == 404
+    assert api_client.post(f"/api/v1/runs/{run_id}/cancel", headers=headers).status_code == 404
+    assert (
+        api_client.post(
+            f"/api/v1/runs/{run_id}/messages",
+            json={"content": "hello"},
+            headers=headers,
+        ).status_code
+        == 404
+    )
+    interrupted = api_client.post(
+        f"/api/v1/agents/{agent_id}/interrupt", headers=headers
+    )
+    assert interrupted.status_code == 404
     with pytest.raises(WebSocketDisconnect) as closed:
         with api_client.websocket_connect(
             f"/ws/runs/{run_id}?after_seq=0", headers={"Origin": WEB_ORIGIN}
         ):
             pass
     assert closed.value.code == 4403
+
+
+def test_run_controls_reject_wrong_states(
+    api_client: TestClient, test_emails: Callable[[], str]
+) -> None:
+    signup(api_client, test_emails())
+    run_id = create_run(api_client)
+    headers = {"Origin": WEB_ORIGIN}
+    assert api_client.post(f"/api/v1/runs/{run_id}/resume", headers=headers).status_code == 409
+    rejected = api_client.post(
+        f"/api/v1/runs/{run_id}/messages",
+        json={"content": "Continue the work."},
+        headers=headers,
+    )
+    assert rejected.status_code == 409
 
 
 def test_reconnect_replays_events_appended_during_replay_without_gaps_or_duplicates(
@@ -149,5 +192,5 @@ def test_reconnect_replays_events_appended_during_replay_without_gaps_or_duplica
         replayed = reconnected.receive_json()
         assert replayed["seq"] == 2
         reconnected.send_json({"type": "run.pause"})
-        stub = reconnected.receive_json()
-        assert stub == {"type": "not_implemented_yet", "request_type": "run.pause"}
+        accepted = reconnected.receive_json()
+        assert accepted == {"type": "request.accepted", "request_type": "run.pause"}

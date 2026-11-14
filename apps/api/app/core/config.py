@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     session_max_age_seconds: int = 43_200
     llm_max_retries: int = 3
     llm_retry_base_seconds: float = 0.25
+    approval_ttl_seconds: int = 86_400
 
     @model_validator(mode="after")
     def prevent_fake_provider_in_production(self) -> "Settings":

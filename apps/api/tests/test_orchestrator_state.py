@@ -1,4 +1,4 @@
-"""Table-driven legal and illegal M3 state-machine transitions."""
+"""Table-driven legal and illegal run state-machine transitions."""
 
 import pytest
 
@@ -10,13 +10,16 @@ LEGAL = {
     "AWAITING_ANSWERS": {"PLANNING", "PAUSED", "FAILED", "CANCELLED"},
     "PLANNING": {"AWAITING_PLAN_APPROVAL", "EXECUTING", "PAUSED", "FAILED", "CANCELLED"},
     "AWAITING_PLAN_APPROVAL": {"EXECUTING", "PAUSED", "FAILED", "CANCELLED"},
-    "EXECUTING": {"PAUSED", "FAILED", "CANCELLED"},
+    "EXECUTING": {"AWAITING_APPROVAL", "PAUSED", "FAILED", "CANCELLED"},
+    "AWAITING_APPROVAL": {"EXECUTING", "PAUSED", "FAILED", "CANCELLED"},
     "PAUSED": {
+        "CREATED",
         "CLARIFYING",
         "AWAITING_ANSWERS",
         "PLANNING",
         "AWAITING_PLAN_APPROVAL",
         "EXECUTING",
+        "AWAITING_APPROVAL",
         "FAILED",
         "CANCELLED",
     },
