@@ -298,9 +298,12 @@ describe("run clarification and plan interface", () => {
     expect(screen.getByLabelText("Run cost").textContent).toContain("1.250000");
     fireEvent.click(screen.getByRole("button", { name: "Pause" }));
     await waitFor(() => expect(api.pauseRun).toHaveBeenCalledWith("run-1"));
-    fireEvent.change(screen.getByLabelText("agent-message"), {
-      target: { value: "Keep the page compact." },
-    });
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Message the run or an agent" }),
+      {
+        target: { value: "Keep the page compact." },
+      },
+    );
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(api.messageRun).toHaveBeenCalledWith(
       "run-1", "Keep the page compact.", undefined,
