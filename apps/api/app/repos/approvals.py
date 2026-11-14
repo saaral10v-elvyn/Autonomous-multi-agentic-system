@@ -1,6 +1,7 @@
 """User-scoped approval persistence."""
 
 from collections.abc import Mapping
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -81,6 +82,19 @@ class ApprovalRepository:
             )
         result = await self._session.execute(statement)
         return result.scalar_one_or_none()
+
+    async def list_expired_pending(
+        self, cutoff: datetime, limit: int = 100
+    ) -> list[tuple[Approval, UUID]]:
+        """Find pending approvals older than the configured TTL."""
+        result = await self._session.execute(
+            select(Approval, Run.user_id)
+            .join(Run, Run.id == Approval.run_id)
+            .where(Approval.status == "pending", Approval.created_at <= cutoff)
+            .order_by(Approval.created_at, Approval.id)
+            .limit(limit)
+        )
+        return [(approval, user_id) for approval, user_id in result.all()]
 
     async def get_for_idempotency_key(
         self, user_id: UUID, run_id: UUID, idempotency_key: str, *, lock: bool = False

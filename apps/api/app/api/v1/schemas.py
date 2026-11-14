@@ -71,6 +71,50 @@ class AnswersRequest(BaseModel):
     answers: dict[str, object]
 
 
+class UserMessageRequest(BaseModel):
+    """A message for the run or a specific owned agent."""
+
+    content: Annotated[str, Field(min_length=1, max_length=8000)]
+    agent_id: UUID | None = None
+
+    @field_validator("content")
+    @classmethod
+    def normalize_content(cls, value: str) -> str:
+        content = value.strip()
+        if not content:
+            raise ValueError("Message content is required.")
+        return content
+
+
+class AgentResponse(BaseModel):
+    """Safe agent state for the run activity panel."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    run_id: UUID
+    parent_id: UUID | None
+    role: str
+    status: str
+    model: str | None
+    spent_usd: Decimal
+
+
+class TaskResponse(BaseModel):
+    """Safe task graph item."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    external_id: str
+    agent_id: UUID | None
+    title: str
+    description: str
+    status: str
+    depends_on: list[UUID]
+    output: dict[str, object] | None
+
+
 class PlanUpdateRequest(BaseModel):
     """User-edited plan validated against the same Planner output schema."""
 

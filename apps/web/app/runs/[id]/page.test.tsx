@@ -33,6 +33,8 @@ describe("run clarification and plan interface", () => {
       created_at: "2026-11-08T00:00:00Z",
     });
     vi.spyOn(api, "runApprovals").mockResolvedValue([]);
+    vi.spyOn(api, "runAgents").mockResolvedValue([]);
+    vi.spyOn(api, "runTasks").mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -266,5 +268,42 @@ describe("run clarification and plan interface", () => {
     expect((await screen.findByRole("alert")).textContent).toContain(
       "This approval has already been decided.",
     );
+  });
+
+  it("renders the agent tree, task list, cost meter and run controls", async () => {
+    stream.events = [{
+      id: "cost-1", run_id: "run-1", seq: 8, type: "cost.updated",
+      payload: { run_spent_usd: "1.250000" }, created_at: "2026-11-08T00:00:00Z",
+    }];
+    vi.mocked(api.runAgents).mockResolvedValue([{
+      id: "agent-1", run_id: "run-1", parent_id: null, role: "coder",
+      status: "running", model: "fake-model", spent_usd: "0.750000",
+    }]);
+    vi.mocked(api.runTasks).mockResolvedValue([{
+      id: "task-1", external_id: "page", agent_id: "agent-1", title: "Build page",
+      description: "Create the first page.", status: "running", depends_on: [], output: null,
+    }]);
+    vi.spyOn(api, "pauseRun").mockResolvedValue({
+      id: "run-1", project_id: "project-1", idea: "Build a journal",
+      autonomy_level: "step_by_step", budget_usd: "25.00", status: "PAUSED",
+      created_at: "2026-11-08T00:00:00Z",
+    });
+    vi.spyOn(api, "messageRun").mockResolvedValue(undefined);
+
+    render(<RunPage />);
+    expect(await screen.findByText("coder · running")).toBeTruthy();
+    expect((await screen.findByText("Build page")).closest("li")?.textContent).toContain(
+      "Build page · running",
+    );
+    expect(screen.getByLabelText("Run cost").textContent).toContain("1.250000");
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    await waitFor(() => expect(api.pauseRun).toHaveBeenCalledWith("run-1"));
+    fireEvent.change(screen.getByLabelText("agent-message"), {
+      target: { value: "Keep the page compact." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(api.messageRun).toHaveBeenCalledWith(
+      "run-1", "Keep the page compact.", undefined,
+    ));
   });
 });

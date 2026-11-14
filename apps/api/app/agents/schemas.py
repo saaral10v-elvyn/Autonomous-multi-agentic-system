@@ -95,3 +95,36 @@ class PlanDocument(BaseModel):
         if visited != len(task_ids):
             raise ValueError("Task dependencies must not contain a cycle.")
         return self
+
+
+class TaskArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=160)
+    uri: str = Field(min_length=1, max_length=2048)
+
+
+class TaskResult(BaseModel):
+    """Structured result returned to the parent task or run scheduler."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["completed", "failed", "interrupted", "waiting_approval"]
+    summary: str = Field(min_length=1, max_length=5000)
+    artifacts: list[TaskArtifact] = Field(default_factory=list, max_length=50)
+    follow_ups: list[str] = Field(default_factory=list, max_length=50)
+
+
+class AdHocRole(BaseModel):
+    """Planner-defined role constrained to an explicitly safe tool subset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    system_prompt: str = Field(min_length=1, max_length=4000)
+    model_tier: Literal["fast", "balanced"] = "fast"
+    tool_allowlist: list[Literal["demo_read", "demo_sandbox_write"]] = Field(
+        default_factory=list, max_length=2
+    )
+    max_steps: int = Field(default=3, ge=1, le=5)
+    max_cost_usd: float = Field(default=0.25, gt=0, le=1)

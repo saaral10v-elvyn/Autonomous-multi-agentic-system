@@ -61,6 +61,7 @@ class ToolExecutionPipeline:
         request_payload = dict(payload)
         events: list[Event] = []
         suspended_approval_id: UUID | None = None
+        new_execution = False
         async with self._sessions() as session:
             run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
             if run is None:
@@ -97,6 +98,23 @@ class ToolExecutionPipeline:
                 )
                 if execution is None:
                     raise LookupError("Run not found.")
+                new_execution = True
+
+            if new_execution:
+                call_event = await self._bus.persist(
+                    session,
+                    user_id,
+                    run_id,
+                    event_type="agent.tool_call",
+                    payload={
+                        "agent_id": str(agent_id),
+                        "tool_name": tool_name,
+                        "tool_call_id": tool_call_id,
+                    },
+                )
+                if call_event is None:
+                    raise LookupError("Run not found.")
+                events.append(call_event)
 
             decision = decide(run.autonomy_level, definition.risk)
             if decision is GateDecision.REQUIRE_APPROVAL:
@@ -150,6 +168,23 @@ class ToolExecutionPipeline:
                 )
                 if request_event is not None:
                     events.append(request_event)
+                result_event = await self._bus.persist(
+                    session,
+                    user_id,
+                    run_id,
+                    event_type="agent.tool_result",
+                    payload={
+                        "agent_id": str(agent_id),
+                        "tool_name": tool_name,
+                        "idempotency_key": call_key,
+                        "output": {
+                            "status": "waiting_approval",
+                            "approval_id": str(approval.id),
+                        },
+                    },
+                )
+                if result_event is not None:
+                    events.append(result_event)
                 await session.commit()
                 refreshed = await _refresh_events(session, events)
             else:

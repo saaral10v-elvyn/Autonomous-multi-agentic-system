@@ -3,7 +3,18 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { api, type Approval, type ApprovalDecision, type AutonomyLevel, type Plan, type Run, type RunEvent, type RunQuestion } from "@/lib/api";
+import {
+  api,
+  type Agent,
+  type Approval,
+  type ApprovalDecision,
+  type AutonomyLevel,
+  type Plan,
+  type Run,
+  type RunEvent,
+  type RunQuestion,
+  type RunTask,
+} from "@/lib/api";
 import { useRunStream } from "@/hooks/use-run-stream";
 
 function isQuestion(value: unknown): value is RunQuestion {
@@ -48,6 +59,10 @@ export default function RunPage() {
   const [planDraft, setPlanDraft] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [tasks, setTasks] = useState<RunTask[]>([]);
+  const [message, setMessage] = useState("");
+  const [targetAgent, setTargetAgent] = useState("");
 
   useEffect(() => {
     void api.run(runId).then(setRun).catch((reason: unknown) =>
@@ -59,6 +74,17 @@ export default function RunPage() {
     void api.runApprovals(runId).then(setApprovals).catch((reason: unknown) =>
       setError(reason instanceof Error ? reason.message : "Could not load approvals."),
     );
+  }, [runId, events]);
+
+  useEffect(() => {
+    void Promise.all([api.runAgents(runId), api.runTasks(runId)])
+      .then(([nextAgents, nextTasks]) => {
+        setAgents(nextAgents);
+        setTasks(nextTasks);
+      })
+      .catch((reason: unknown) => setError(
+        reason instanceof Error ? reason.message : "Could not load agent activity.",
+      ));
   }, [runId, events]);
 
   useEffect(() => {
@@ -160,6 +186,38 @@ export default function RunPage() {
     }
   }
 
+  async function sendMessage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      await api.messageRun(runId, message, targetAgent || undefined);
+      setMessage("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not send message.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function runControl(action: "pause" | "resume" | "cancel") {
+    setSaving(true);
+    setError("");
+    try {
+      const updated = action === "pause" ? await api.pauseRun(runId)
+        : action === "resume" ? await api.resumeRun(runId) : await api.cancelRun(runId);
+      setRun(updated);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : `Could not ${action} run.`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const costEvent = [...events].reverse().find((event) => event.type === "cost.updated");
+  const spent = typeof costEvent?.payload.run_spent_usd === "string"
+    ? costEvent.payload.run_spent_usd : "0";
+
   return <main className="mx-auto max-w-4xl space-y-6 p-8">
     <Link href="/runs" className="text-sm underline">← All runs</Link>
     {error && <p role="alert" className="rounded border border-red-300 p-3 text-red-700">{error}</p>}
@@ -168,6 +226,23 @@ export default function RunPage() {
         <p className="text-sm text-slate-500">{connected ? "Live" : "Reconnecting"} · <span aria-label="Run state">{status}</span></p>
         <h1 className="text-3xl font-semibold">{run.idea}</h1>
         <p>Budget cap: ${run.budget_usd}</p>
+        <p aria-label="Run cost">Spent: ${spent} / ${run.budget_usd}</p>
+        <div className="flex flex-wrap gap-2">
+          {status === "PAUSED" ? <button
+            disabled={saving}
+            onClick={() => void runControl("resume")}
+            className="rounded border px-3 py-2"
+          >Resume</button> : <button
+            disabled={saving}
+            onClick={() => void runControl("pause")}
+            className="rounded border px-3 py-2"
+          >Pause</button>}
+          <button
+            disabled={saving || status === "CANCELLED" || status === "COMPLETED"}
+            onClick={() => void runControl("cancel")}
+            className="rounded border px-3 py-2"
+          >Cancel</button>
+        </div>
         <label className="flex items-center gap-3" htmlFor="autonomy-level">
           <span className="font-medium">Autonomy</span>
           <select
@@ -253,6 +328,65 @@ export default function RunPage() {
           <div className="flex gap-3"><button type="button" disabled={saving} onClick={() => void savePlan()} className="rounded border px-4 py-2">Save edits</button><button type="button" disabled={saving} onClick={() => void approvePlan()} className="rounded bg-slate-900 px-4 py-2 text-white">Approve plan</button></div>
         </div>}
       </section>}
+      <section aria-label="Agent tree and task list" className="space-y-4 rounded-xl border p-5">
+        <h2 className="text-xl font-medium">Agents</h2>
+        {agents.length === 0 ? <p className="text-slate-600">No agents yet.</p> : <ul
+          className="space-y-2"
+        >
+          {agents.map((agent) => <li
+            key={agent.id}
+            className="flex flex-wrap items-center justify-between gap-2 rounded border p-3"
+          >
+            <span>{agent.parent_id ? "↳ " : ""}{agent.role} · {agent.status}</span>
+            <span className="text-sm text-slate-600">${agent.spent_usd}</span>
+            {agent.status === "running" && <button disabled={saving} onClick={() => {
+              setSaving(true);
+              void api.interruptAgent(agent.id).then((updated) => {
+                setAgents((current) => current.map((item) =>
+                  item.id === updated.id ? updated : item,
+                ));
+              }).catch((reason: unknown) => setError(
+                reason instanceof Error ? reason.message : "Could not interrupt agent.",
+              )).finally(() => setSaving(false));
+            }} className="rounded border px-2 py-1">Interrupt</button>}
+          </li>)}
+        </ul>}
+        <h3 className="font-medium">Tasks</h3>
+        {tasks.length === 0 ? <p className="text-slate-600">No scheduled tasks.</p> : <ul
+          className="space-y-2"
+        >
+          {tasks.map((task) => <li key={task.id} className="rounded border p-3">
+            <span className="font-medium">{task.title}</span> · {task.status}
+            {task.depends_on.length > 0 && <p className="text-sm text-slate-600">
+              Depends on: {task.depends_on.join(", ")}
+            </p>}
+          </li>)}
+        </ul>}
+        <form onSubmit={(event) => void sendMessage(event)} className="space-y-2">
+          <label htmlFor="agent-message" className="font-medium">Message the run or an agent</label>
+          <select
+            aria-label="Message target agent"
+            value={targetAgent}
+            onChange={(event) => setTargetAgent(event.target.value)}
+            className="block rounded border p-2 text-slate-900"
+          >
+            <option value="">Run</option>
+            {agents.map((agent) => <option key={agent.id} value={agent.id}>
+              {agent.role} · {agent.id.slice(0, 8)}
+            </option>)}
+          </select>
+          <textarea
+            id="agent-message"
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            className="min-h-20 w-full rounded border p-3 text-slate-900"
+          />
+          <button
+            disabled={saving || message.trim().length === 0}
+            className="rounded bg-slate-900 px-4 py-2 text-white"
+          >Send message</button>
+        </form>
+      </section>
       <section className="space-y-3">
         <h2 className="text-xl font-medium">Run activity</h2>
         {events.length === 0 ? <p className="text-slate-600">Waiting for events…</p> : events.map((event) => <EventCard key={event.seq} event={event} />)}

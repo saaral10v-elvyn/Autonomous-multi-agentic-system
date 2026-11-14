@@ -11,6 +11,7 @@ from app.models.project import Project
 from app.models.provider_key import ProviderKey
 from app.models.question import Question
 from app.models.run import Run
+from app.models.task import Task
 from app.models.tool_execution import ToolExecution
 from app.models.user import User
 
@@ -26,6 +27,7 @@ __all__ = [
     "ProviderKey",
     "Question",
     "Run",
+    "Task",
     "ToolExecution",
     "User",
 ]

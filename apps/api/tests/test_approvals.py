@@ -658,3 +658,5 @@ def test_approval_payloads_and_events_do_not_expose_provider_key(
     assert events.status_code == 200
     assert secret not in approvals.text
     assert secret not in events.text
+    event_types = {event["type"] for event in events.json()}
+    assert {"agent.tool_call", "agent.tool_result"}.issubset(event_types)

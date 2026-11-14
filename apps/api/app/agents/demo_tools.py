@@ -45,7 +45,11 @@ def demo_tool_registry(settings: Settings | None = None) -> ToolRegistry:
     return registry
 
 
-def agent_tool_registry(settings: Settings | None = None) -> ToolRegistry:
+def agent_tool_registry(
+    settings: Settings | None = None,
+    *,
+    spawn_handler: ToolHandler | None = None,
+) -> ToolRegistry:
     """Build the baseline workflow tool plus optional fake-provider demo tools."""
     active_settings = settings or get_settings()
     registry = ToolRegistry()
@@ -71,6 +75,46 @@ def agent_tool_registry(settings: Settings | None = None) -> ToolRegistry:
             "additionalProperties": False,
         },
     )
+
+    async def finish(payload: Mapping[str, object], _: str) -> Mapping[str, object]:
+        return dict(payload)
+
+    registry.register(
+        "finish",
+        finish,
+        risk=RiskClass.READ,
+        description="Finish the task and return its structured result.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["completed", "failed"]},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 5000},
+                "artifacts": {"type": "array", "items": {"type": "object"}},
+                "follow_ups": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["status", "summary"],
+            "additionalProperties": False,
+        },
+    )
+    if spawn_handler is not None:
+        registry.register(
+            "spawn_agent",
+            spawn_handler,
+            risk=RiskClass.READ,
+            description="Spawn a bounded child agent for a related task.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "role": {"type": "string"},
+                    "task": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "context_refs": {"type": "array", "items": {"type": "string"}},
+                    "parent_id": {"type": "string", "format": "uuid"},
+                    "ad_hoc_role": {"type": "object"},
+                },
+                "required": ["role", "task", "parent_id"],
+                "additionalProperties": False,
+            },
+        )
     for tool in demo_tool_registry(active_settings).list():
         registry.register(
             tool.name,

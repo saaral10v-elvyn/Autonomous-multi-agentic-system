@@ -1,11 +1,12 @@
 """Approval decisions and autonomy changes for active runs."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.db import SessionFactory
 from app.events.bus import EventBus
 from app.models.approval import Approval
 from app.models.event import Event
@@ -155,6 +156,52 @@ async def enqueue_approval_resume(user_id: UUID, run_id: UUID, approval_id: UUID
         )
     finally:
         await pool.close()
+
+
+async def expire_pending_approvals(limit: int = 100) -> int:
+    """Expire stale approvals and enqueue structured-feedback resumption."""
+    cutoff = datetime.now(UTC) - timedelta(seconds=get_settings().approval_ttl_seconds)
+    async with SessionFactory() as session:
+        expired = await ApprovalRepository(session).list_expired_pending(cutoff, limit)
+    count = 0
+    for candidate, user_id in expired:
+        bus = EventBus()
+        async with SessionFactory() as session:
+            approval = await ApprovalRepository(session).get_for_user(
+                user_id, candidate.id, lock=True
+            )
+            run = await RunRepository(session).get_for_user(user_id, candidate.run_id, lock=True)
+            if approval is None or run is None or approval.status != "pending":
+                continue
+            approval.status = "expired"
+            approval.decided_at = datetime.now(UTC)
+            resolved = await bus.persist(
+                session,
+                user_id,
+                run.id,
+                event_type="approval.resolved",
+                payload={"approval_id": str(approval.id), "decision": "expired"},
+            )
+            events = [resolved]
+            should_resume = run.status == "AWAITING_APPROVAL"
+            if should_resume:
+                events.append(
+                    await stage_transition(
+                        session,
+                        user_id,
+                        run,
+                        "EXECUTING",
+                        event_bus=bus,
+                        payload={"approval_expired": str(approval.id)},
+                    )
+                )
+            await session.commit()
+            committed = await _refresh_events(session, events)
+        await _publish_all(bus, committed)
+        if should_resume:
+            await enqueue_approval_resume(user_id, run.id, approval.id)
+        count += 1
+    return count
 
 
 async def _refresh_events(session: AsyncSession, events: list[Event | None]) -> list[Event]:

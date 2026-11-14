@@ -36,6 +36,43 @@ class AgentRepository:
             await self._session.flush()
         return agent
 
+    async def get_or_create_for_task(
+        self,
+        user_id: UUID,
+        run_id: UUID,
+        role: str,
+        task_id: UUID,
+        config: Mapping[str, object],
+        parent_id: UUID | None = None,
+    ) -> Agent | None:
+        """Get the stable agent instance assigned to one durable task."""
+        run = await self._session.scalar(
+            select(Run).where(Run.id == run_id, Run.user_id == user_id).with_for_update()
+        )
+        if run is None:
+            return None
+        agent = await self._session.scalar(
+            select(Agent)
+            .where(
+                Agent.run_id == run_id,
+                Agent.role == role,
+                Agent.config["task_id"].astext == str(task_id),
+            )
+            .with_for_update()
+        )
+        if agent is None:
+            task_config = {**config, "task_id": str(task_id)}
+            agent = Agent(
+                run_id=run_id,
+                parent_id=parent_id,
+                role=role,
+                config=task_config,
+                status="created",
+            )
+            self._session.add(agent)
+            await self._session.flush()
+        return agent
+
     async def get_for_role(self, user_id: UUID, run_id: UUID, role: str) -> Agent | None:
         """Get one agent role instance through its owning user run."""
         result = await self._session.execute(
@@ -52,6 +89,17 @@ class AgentRepository:
             .join(Run, Run.id == Agent.run_id)
             .where(Run.user_id == user_id, Agent.id == agent_id)
         )
+
+    async def list_for_run(self, user_id: UUID, run_id: UUID) -> list[Agent] | None:
+        owned = await self._session.scalar(
+            select(Run.id).where(Run.user_id == user_id, Run.id == run_id)
+        )
+        if owned is None:
+            return None
+        result = await self._session.scalars(
+            select(Agent).where(Agent.run_id == run_id).order_by(Agent.created_at, Agent.id)
+        )
+        return list(result.all())
 
     async def list_steps_for_agent(self, user_id: UUID, agent_id: UUID) -> list[AgentStep]:
         result = await self._session.execute(
