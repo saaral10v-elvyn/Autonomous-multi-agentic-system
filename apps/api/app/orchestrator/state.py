@@ -43,14 +43,7 @@ def validate_transition(current: str, target: str) -> None:
         return
     if target == "PAUSED" and current in ACTIVE_STATES:
         return
-    if current == "PAUSED" and target in {
-        "CLARIFYING",
-        "AWAITING_ANSWERS",
-        "PLANNING",
-        "AWAITING_PLAN_APPROVAL",
-        "EXECUTING",
-        "AWAITING_APPROVAL",
-    }:
+    if current == "PAUSED" and target in ACTIVE_STATES:
         return
     if target not in LEGAL_TRANSITIONS.get(current, set()):
         raise IllegalRunTransition(f"Cannot transition run from {current} to {target}.")

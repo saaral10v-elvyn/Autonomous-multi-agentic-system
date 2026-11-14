@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from app.api.v1.deps import CurrentUser, DbSession
 from app.api.v1.schemas import (
+    AgentResponse,
     AnswersRequest,
     ApprovalResponse,
     AutonomyUpdateRequest,
@@ -15,9 +16,14 @@ from app.api.v1.schemas import (
     RunCreateRequest,
     RunEventResponse,
     RunResponse,
+    TaskResponse,
+    UserMessageRequest,
 )
+from app.orchestrator.state import IllegalRunTransition
+from app.repos.agents import AgentRepository
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
+from app.repos.tasks import TaskRepository
 from app.services.approvals import ApprovalConflict, ApprovalService
 from app.services.orchestration import (
     InvalidAnswers,
@@ -26,6 +32,7 @@ from app.services.orchestration import (
     WorkflowConflict,
     enqueue_advance,
 )
+from app.services.run_controls import RunControlService
 from app.services.runs import RunService
 
 router = APIRouter(prefix="/runs")
@@ -70,6 +77,77 @@ async def get_run_events(
     if await EventRepository(session).high_watermark(user.id, run_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
     return [RunEventResponse.model_validate(event) for event in events]
+
+
+@router.get("/{run_id}/agents", response_model=list[AgentResponse])
+async def list_run_agents(
+    run_id: UUID, user: CurrentUser, session: DbSession
+) -> list[AgentResponse]:
+    agents = await AgentRepository(session).list_for_run(user.id, run_id)
+    if agents is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return [AgentResponse.model_validate(agent) for agent in agents]
+
+
+@router.get("/{run_id}/tasks", response_model=list[TaskResponse])
+async def list_run_tasks(run_id: UUID, user: CurrentUser, session: DbSession) -> list[TaskResponse]:
+    tasks = await TaskRepository(session).list_for_run(user.id, run_id)
+    if tasks is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return [TaskResponse.model_validate(task) for task in tasks]
+
+
+@router.post("/{run_id}/messages", status_code=status.HTTP_202_ACCEPTED)
+async def send_run_message(
+    run_id: UUID,
+    payload: UserMessageRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> dict[str, str]:
+    try:
+        await RunControlService(session).message(
+            user.id, run_id, payload.content.strip(), payload.agent_id
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Run or agent not found.") from None
+    except IllegalRunTransition as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    return {"status": "accepted"}
+
+
+@router.post("/{run_id}/pause", response_model=RunResponse)
+async def pause_run(run_id: UUID, user: CurrentUser, session: DbSession) -> RunResponse:
+    try:
+        run = await RunControlService(session).pause(user.id, run_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Run not found.") from None
+    except IllegalRunTransition as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    return RunResponse.model_validate(run)
+
+
+@router.post("/{run_id}/resume", response_model=RunResponse)
+async def resume_run_endpoint(run_id: UUID, user: CurrentUser, session: DbSession) -> RunResponse:
+    try:
+        run = await RunControlService(session).resume(user.id, run_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Run not found.") from None
+    except IllegalRunTransition as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    if run.status != "AWAITING_APPROVAL":
+        await enqueue_advance(user.id, run_id)
+    return RunResponse.model_validate(run)
+
+
+@router.post("/{run_id}/cancel", response_model=RunResponse)
+async def cancel_run(run_id: UUID, user: CurrentUser, session: DbSession) -> RunResponse:
+    try:
+        run = await RunControlService(session).cancel(user.id, run_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Run not found.") from None
+    except IllegalRunTransition as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    return RunResponse.model_validate(run)
 
 
 @router.get("/{run_id}/approvals", response_model=list[ApprovalResponse])
@@ -139,4 +217,5 @@ async def approve_plan(run_id: UUID, user: CurrentUser, session: DbSession) -> R
         raise HTTPException(status_code=404, detail="Run not found.") from None
     except WorkflowConflict as error:
         raise HTTPException(status_code=409, detail=str(error)) from None
+    await enqueue_advance(user.id, run_id)
     return RunResponse.model_validate(run)

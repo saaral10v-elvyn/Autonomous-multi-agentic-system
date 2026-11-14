@@ -3,10 +3,12 @@
 from typing import Any
 from uuid import UUID
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from app.api.v1.deps import get_llm_client
 from app.core.config import get_settings
+from app.services.approvals import expire_pending_approvals
 from app.services.orchestration import advance_run_job, resume_approval_job
 
 
@@ -28,8 +30,15 @@ async def resume_approval(_: Any, user_id: str, run_id: str, approval_id: str) -
     return result.status
 
 
+async def expire_approvals(ctx: dict[Any, Any], *args: Any, **kwargs: Any) -> int:
+    """Resolve approvals that exceeded the configured human-response TTL."""
+    del ctx, args, kwargs
+    return await expire_pending_approvals()
+
+
 class WorkerSettings:
     """Arq worker configuration."""
 
     functions = [noop_job, advance_run, resume_approval]
+    cron_jobs = [cron(expire_approvals, minute=set(range(60)))]
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

@@ -57,6 +57,25 @@ export type RunEvent = {
   payload: Record<string, unknown>;
   created_at: string;
 };
+export type Agent = {
+  id: string;
+  run_id: string;
+  parent_id: string | null;
+  role: string;
+  status: string;
+  model: string | null;
+  spent_usd: string;
+};
+export type RunTask = {
+  id: string;
+  external_id: string;
+  agent_id: string | null;
+  title: string;
+  description: string;
+  status: string;
+  depends_on: string[];
+  output: Record<string, unknown> | null;
+};
 export type QuestionOption = { id: string; label: string };
 export type RunQuestion = {
   id: string;
@@ -117,6 +136,8 @@ export const api = {
   createRun: (idea: string, autonomy_level: AutonomyLevel, budget_usd: number) => request<Run>("/runs", { method: "POST", body: JSON.stringify({ idea, autonomy_level, budget_usd }) }),
   runs: () => request<Run[]>("/runs"),
   run: (id: string) => request<Run>(`/runs/${id}`),
+  runAgents: (id: string) => request<Agent[]>(`/runs/${id}/agents`),
+  runTasks: (id: string) => request<RunTask[]>(`/runs/${id}/tasks`),
   runEvents: (id: string, afterSeq: number) => request<RunEvent[]>(`/runs/${id}/events?after_seq=${afterSeq}`),
   submitRunAnswers: (id: string, answers: Record<string, unknown>) => request<Run>(`/runs/${id}/answers`, { method: "POST", body: JSON.stringify({ answers }) }),
   updateRunPlan: (id: string, plan: Plan) => request<Plan>(`/runs/${id}/plan`, { method: "PUT", body: JSON.stringify({ plan }) }),
@@ -124,4 +145,13 @@ export const api = {
   runApprovals: (id: string) => request<Approval[]>(`/runs/${id}/approvals`),
   decideApproval: (id: string, decision: ApprovalDecision, edited_payload?: Record<string, unknown>) => request<ApprovalDecisionResult>(`/approvals/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, edited_payload }) }),
   updateRunAutonomy: (id: string, autonomy_level: AutonomyLevel) => request<Run>(`/runs/${id}/autonomy`, { method: "PATCH", body: JSON.stringify({ autonomy_level }) }),
+  messageRun: (id: string, content: string, agent_id?: string) =>
+    request<void>(`/runs/${id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content, agent_id }),
+    }),
+  pauseRun: (id: string) => request<Run>(`/runs/${id}/pause`, { method: "POST" }),
+  resumeRun: (id: string) => request<Run>(`/runs/${id}/resume`, { method: "POST" }),
+  cancelRun: (id: string) => request<Run>(`/runs/${id}/cancel`, { method: "POST" }),
+  interruptAgent: (id: string) => request<Agent>(`/agents/${id}/interrupt`, { method: "POST" }),
 };

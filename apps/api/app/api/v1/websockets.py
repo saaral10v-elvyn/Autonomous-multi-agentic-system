@@ -26,6 +26,7 @@ from app.services.orchestration import (
     QuestionService,
     enqueue_advance,
 )
+from app.services.run_controls import RunControlService
 
 router = APIRouter()
 
@@ -47,7 +48,7 @@ class ApprovalDecide(BaseModel):
 class UserMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     type: Literal["user.message"]
-    content: str
+    content: str = Field(min_length=1, max_length=8000)
     agent_id: UUID | None = None
 
 
@@ -226,6 +227,39 @@ async def run_event_stream(websocket: WebSocket, run_id: UUID, after_seq: int = 
                                     "request_type": client_message.type,
                                     "feedback": feedback,
                                 }
+                            )
+                        elif isinstance(client_message, UserMessage):
+                            async with SessionFactory() as session:
+                                await RunControlService(session).message(
+                                    user_id,
+                                    run_id,
+                                    client_message.content,
+                                    client_message.agent_id,
+                                )
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
+                            )
+                        elif isinstance(client_message, RunControl):
+                            async with SessionFactory() as session:
+                                controls = RunControlService(session)
+                                if client_message.type == "run.pause":
+                                    await controls.pause(user_id, run_id)
+                                elif client_message.type == "run.resume":
+                                    resumed = await controls.resume(user_id, run_id)
+                                    if resumed.status != "AWAITING_APPROVAL":
+                                        await enqueue_advance(user_id, run_id)
+                                else:
+                                    await controls.cancel(user_id, run_id)
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
+                            )
+                        elif isinstance(client_message, AgentInterrupt):
+                            async with SessionFactory() as session:
+                                await RunControlService(session).interrupt(
+                                    user_id, client_message.agent_id
+                                )
+                            await websocket.send_json(
+                                {"type": "request.accepted", "request_type": client_message.type}
                             )
                         else:
                             await websocket.send_json(
