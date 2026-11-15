@@ -1,22 +1,27 @@
-"""M3 Clarifier/Planner orchestration and shared human-input services."""
+"""Run orchestration, human-input flows, and durable approval resumption."""
 
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
+from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.registry import ROLE_TEMPLATES
+from app.agents.demo_tools import agent_tool_registry
+from app.agents.registry import ROLE_TEMPLATES, RoleTemplate
 from app.agents.runtime import AgentRuntime, BudgetExceededError
 from app.agents.schemas import PlanDocument, QuestionSet
 from app.core.config import get_settings
 from app.core.db import SessionFactory
 from app.events.bus import EventBus
+from app.gate.engine import GateDecision, RiskClass, WorkflowGate, decide
 from app.llm.client import LLMClient
 from app.llm.errors import LLMRequestError, ProviderKeyUnavailable
-from app.llm.types import Provider
+from app.llm.types import ModelTier, Provider
 from app.models.agent import Agent
 from app.models.event import Event
 from app.models.message import Message
@@ -24,10 +29,16 @@ from app.models.provider_key import ProviderKey
 from app.models.question import Question
 from app.models.run import Run
 from app.orchestrator.state import IllegalRunTransition, stage_transition
+from app.repos.agents import AgentRepository
+from app.repos.approvals import ApprovalRepository
 from app.repos.plans import PlanRepository
 from app.repos.provider_keys import ProviderKeyRepository
 from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
+from app.repos.tasks import TaskRepository
+from app.repos.tool_executions import ToolExecutionRepository
+from app.services.spawning import AgentSpawner
+from app.services.tools import ToolExecutionPipeline, ToolExecutionResult
 
 
 class WorkflowConflict(ValueError):
@@ -111,6 +122,8 @@ class RunOrchestrator:
             keys = await ProviderKeyRepository(session).list_for_user(user_id)
         if run is None:
             raise LookupError("Run not found.")
+        if run.status == "EXECUTING":
+            return await self._advance_tasks(user_id, run_id)
         if run.status not in {"CREATED", "CLARIFYING", "PLANNING"}:
             return run.status
         provider_info = _provider_context(user_id, keys)
@@ -146,13 +159,243 @@ class RunOrchestrator:
             await self._plan(user_id, run_id, run.idea, provider, provider_key_id)
             async with SessionFactory() as session:
                 latest = await RunRepository(session).get_for_user(user_id, run_id)
-                return latest.status if latest is not None else "FAILED"
+                next_status = latest.status if latest is not None else "FAILED"
+            if next_status == "EXECUTING":
+                await enqueue_advance(user_id, run_id)
+            return next_status
         return run.status
+
+    async def _advance_tasks(self, user_id: UUID, run_id: UUID) -> str:
+        """Run dependency-ready tasks in bounded batches, resuming running rows."""
+        async with SessionFactory() as session:
+            run = await RunRepository(session).get_for_user(user_id, run_id)
+            keys = await ProviderKeyRepository(session).list_for_user(user_id)
+        if run is None:
+            raise LookupError("Run not found.")
+        provider_info = _provider_context(user_id, keys)
+        if provider_info is None:
+            return "EXECUTING"
+        provider, provider_key_id = provider_info
+        template = ROLE_TEMPLATES["coder"]
+        while True:
+            async with SessionFactory() as session:
+                current = await RunRepository(session).get_for_user(user_id, run_id)
+                if current is None or current.status != "EXECUTING":
+                    return current.status if current is not None else "FAILED"
+                batch = await TaskRepository(session).claim_ready(user_id, run_id, 4)
+                if batch is None:
+                    raise LookupError("Run not found.")
+                tasks, blocked_tasks, newly_claimed = batch
+                assignments: list[tuple[UUID, UUID, str, int]] = []
+                pending_events: list[Event | None] = []
+                for blocked_task in blocked_tasks:
+                    blocked_event = await self._bus.persist(
+                        session,
+                        user_id,
+                        run_id,
+                        event_type="task.updated",
+                        payload={
+                            "task_id": str(blocked_task.id),
+                            "status": "blocked",
+                            "result": blocked_task.output or {},
+                        },
+                    )
+                    pending_events.append(blocked_event)
+                for task in tasks:
+                    attempts = task.input.get("attempts", 0)
+                    attempt_count = attempts + 1 if isinstance(attempts, int) else 1
+                    task.input = {**task.input, "attempts": attempt_count}
+                    config = {
+                        "name": template.name,
+                        "system_prompt": template.system_prompt,
+                        "model_tier": template.model_tier.value,
+                        "tool_allowlist": list(template.tool_allowlist),
+                        "output_schema": template.output_schema,
+                        "max_steps": template.max_steps,
+                        "max_cost_usd": template.max_cost_usd,
+                    }
+                    agent_repo = AgentRepository(session)
+                    agent = (
+                        await agent_repo.get_for_id(user_id, task.agent_id)
+                        if task.agent_id is not None
+                        else None
+                    )
+                    is_new_agent = agent is None
+                    if agent is None:
+                        agent = await agent_repo.get_or_create_for_task(
+                            user_id, run_id, "coder", task.id, config
+                        )
+                    if agent is None:
+                        raise LookupError("Run not found.")
+                    status_changed = agent.status != "running"
+                    task.agent_id = agent.id
+                    agent.status = "running"
+                    if is_new_agent:
+                        pending_events.append(
+                            await self._bus.persist(
+                                session,
+                                user_id,
+                                run_id,
+                                event_type="agent.spawned",
+                                payload={
+                                    "agent_id": str(agent.id),
+                                    "parent_id": None,
+                                    "role": agent.role,
+                                    "task_id": str(task.id),
+                                },
+                            )
+                        )
+                    if is_new_agent or status_changed:
+                        pending_events.append(
+                            await self._bus.persist(
+                                session,
+                                user_id,
+                                run_id,
+                                event_type="agent.status",
+                                payload={"agent_id": str(agent.id), "status": "running"},
+                            )
+                        )
+                    if task.id in newly_claimed:
+                        task_event = await self._bus.persist(
+                            session,
+                            user_id,
+                            run_id,
+                            event_type="task.updated",
+                            payload={
+                                "task_id": str(task.id),
+                                "agent_id": str(agent.id),
+                                "status": "running",
+                            },
+                        )
+                        pending_events.append(task_event)
+                    assignments.append(
+                        (task.id, agent.id, f"{task.title}: {task.description}", attempt_count)
+                    )
+                await session.commit()
+                committed_events = await _refresh_events(session, pending_events)
+            await _publish_all(self._bus, committed_events)
+            if not assignments:
+                return "EXECUTING"
+            outcomes = await asyncio.gather(
+                *(
+                    self._execute_task(
+                        user_id,
+                        run_id,
+                        task_id,
+                        agent_id,
+                        prompt,
+                        attempt,
+                        provider,
+                        provider_key_id,
+                        template,
+                    )
+                    for task_id, agent_id, prompt, attempt in assignments
+                )
+            )
+            if any(outcome == "paused" for outcome in outcomes):
+                return "PAUSED"
+            if any(outcome == "suspended" for outcome in outcomes):
+                return "AWAITING_APPROVAL"
+
+    async def _execute_task(
+        self,
+        user_id: UUID,
+        run_id: UUID,
+        task_id: UUID,
+        agent_id: UUID,
+        prompt: str,
+        attempt: int,
+        provider: Provider,
+        provider_key_id: UUID,
+        template: RoleTemplate,
+    ) -> str:
+        """Execute and durably finish one scheduled task attempt."""
+        from app.agents.schemas import TaskResult
+
+        spawner = AgentSpawner(SessionFactory, self._llm, provider, provider_key_id, self._bus)
+        registry = agent_tool_registry(spawn_handler=spawner.handler(user_id, run_id, agent_id))
+        try:
+            result = await self._runtime.run_task(
+                user_id,
+                run_id,
+                agent_id,
+                provider,
+                provider_key_id,
+                template,
+                prompt,
+                self._llm,
+                registry,
+            )
+        except IllegalRunTransition:
+            async with SessionFactory() as session:
+                paused_run = await RunRepository(session).get_for_user(user_id, run_id)
+            if paused_run is not None and paused_run.status == "PAUSED":
+                return "paused"
+            result = TaskResult(status="failed", summary="The task could not continue.")
+        except BudgetExceededError as error:
+            result = TaskResult(status="failed", summary=str(error))
+        except (LookupError, ValueError, LLMRequestError, ProviderKeyUnavailable) as error:
+            result = TaskResult(status="failed", summary=str(error))
+        status_value: Literal[
+            "completed",
+            "failed",
+            "interrupted",
+            "waiting_approval",
+            "running",
+            "pending",
+        ] = result.status
+        if status_value == "waiting_approval":
+            status_value = "running"
+        if status_value == "failed" and attempt < 2:
+            status_value = "pending"
+        async with SessionFactory() as session:
+            task = await TaskRepository(session).finish(
+                user_id,
+                run_id,
+                task_id,
+                status_value,
+                result.model_dump(mode="json"),
+            )
+            agent = await AgentRepository(session).get_for_id(user_id, agent_id)
+            if task is None or agent is None:
+                raise LookupError("Task or agent not found.")
+            if status_value in {"completed", "failed", "interrupted"}:
+                agent.status = (
+                    "completed"
+                    if status_value == "completed"
+                    else "interrupted"
+                    if status_value == "interrupted"
+                    else "failed"
+                )
+            task_event = await self._bus.persist(
+                session,
+                user_id,
+                run_id,
+                event_type="task.updated",
+                payload={
+                    "task_id": str(task.id),
+                    "agent_id": str(agent.id),
+                    "status": status_value,
+                    "result": result.model_dump(mode="json"),
+                },
+            )
+            status_event = await self._bus.persist(
+                session,
+                user_id,
+                run_id,
+                event_type="agent.status",
+                payload={"agent_id": str(agent.id), "status": agent.status},
+            )
+            await session.commit()
+            events = await _refresh_events(session, [task_event, status_event])
+        await _publish_all(self._bus, events)
+        return "suspended" if result.status == "waiting_approval" else status_value
 
     async def _clarify(
         self, user_id: UUID, run_id: UUID, idea: str, provider: Provider, key_id: UUID
     ) -> None:
         template = ROLE_TEMPLATES["clarifier"]
+        tool_registry = agent_tool_registry()
         try:
             response = await self._runtime.complete(
                 user_id,
@@ -165,10 +408,27 @@ class RunOrchestrator:
                     {"role": "user", "content": idea},
                 ],
                 self._llm,
+                tool_registry=tool_registry,
             )
             if len(response.tool_calls) != 1 or response.tool_calls[0].name != "ask_user":
                 raise ValueError("Clarifier did not return the ask_user tool.")
-            questions = QuestionSet.model_validate(response.tool_calls[0].arguments)
+            tool_call = response.tool_calls[0]
+            questions = QuestionSet.model_validate(tool_call.arguments)
+            async with SessionFactory() as session:
+                agent = await AgentRepository(session).get_for_role(user_id, run_id, template.name)
+            if agent is None:
+                raise LookupError("Clarifier agent was not found.")
+            tool_result = await self._runtime.execute_tool_call(
+                user_id,
+                run_id,
+                agent.id,
+                tool_call,
+                tool_registry,
+                reason="Present the clarifying questions required to prepare a plan.",
+            )
+            if tool_result.status != "completed" or tool_result.output is None:
+                return
+            questions = QuestionSet.model_validate(tool_result.output)
         except BudgetExceededError:
             await _mark_failed(user_id, run_id, "Run budget exhausted before the next LLM call.")
             return
@@ -187,7 +447,21 @@ class RunOrchestrator:
             )
             if question is None:
                 raise LookupError("Run not found.")
-            await _complete_agent(session, user_id, run_id, "clarifier")
+            completed_agent = await _complete_agent(session, user_id, run_id, "clarifier")
+            status_event = (
+                await bus.persist(
+                    session,
+                    user_id,
+                    run_id,
+                    event_type="agent.status",
+                    payload={
+                        "agent_id": str(completed_agent.id),
+                        "status": "completed",
+                    },
+                )
+                if completed_agent is not None
+                else None
+            )
             question_event = await bus.persist(
                 session,
                 user_id,
@@ -202,7 +476,7 @@ class RunOrchestrator:
                 session, user_id, run, "AWAITING_ANSWERS", event_bus=bus
             )
             await session.commit()
-            events = await _refresh_events(session, [question_event, state_event])
+            events = await _refresh_events(session, [status_event, question_event, state_event])
         await _publish_all(bus, events)
 
     async def _plan(
@@ -251,7 +525,21 @@ class RunOrchestrator:
             )
             if saved is None:
                 raise LookupError("Run not found.")
-            await _complete_agent(session, user_id, run_id, "planner")
+            completed_agent = await _complete_agent(session, user_id, run_id, "planner")
+            completed_status_event = (
+                await bus.persist(
+                    session,
+                    user_id,
+                    run_id,
+                    event_type="agent.status",
+                    payload={
+                        "agent_id": str(completed_agent.id),
+                        "status": "completed",
+                    },
+                )
+                if completed_agent is not None
+                else None
+            )
             plan_event = await bus.persist(
                 session,
                 user_id,
@@ -259,8 +547,25 @@ class RunOrchestrator:
                 event_type="plan.created",
                 payload={"artifact_id": str(saved.id), "plan": plan.model_dump(mode="json")},
             )
-            pending = [plan_event]
-            if run.autonomy_level == "autopilot":
+            pending = [completed_status_event, plan_event]
+            plan_decision = decide(
+                run.autonomy_level,
+                RiskClass.READ,
+                {"gate": WorkflowGate.PLAN_APPROVAL.value},
+            )
+            if plan_decision is GateDecision.AUTO:
+                task_rows = await TaskRepository(session).create_from_plan(user_id, run_id, plan)
+                if task_rows is None:
+                    raise LookupError("Run not found.")
+                tasks_event = await bus.persist(
+                    session,
+                    user_id,
+                    run_id,
+                    event_type="task.updated",
+                    payload={"count": len(task_rows), "status": "pending"},
+                )
+                if tasks_event is not None:
+                    pending.append(tasks_event)
                 auto_event = await bus.persist(
                     session,
                     user_id,
@@ -287,7 +592,9 @@ class RunOrchestrator:
         await _publish_all(bus, events)
 
 
-async def _complete_agent(session: AsyncSession, user_id: UUID, run_id: UUID, role: str) -> None:
+async def _complete_agent(
+    session: AsyncSession, user_id: UUID, run_id: UUID, role: str
+) -> Agent | None:
     agent = await session.scalar(
         select(Agent)
         .join(Run, Run.id == Agent.run_id)
@@ -296,6 +603,7 @@ async def _complete_agent(session: AsyncSession, user_id: UUID, run_id: UUID, ro
     )
     if agent is not None:
         agent.status = "completed"
+    return agent
 
 
 async def _latest_answered_question(
@@ -427,6 +735,25 @@ class PlanService:
         plan = await PlanRepository(self._session).latest_for_run(user_id, run_id)
         if plan is None:
             raise WorkflowConflict("A plan must exist before it can be approved.")
+        raw_plan = plan.meta.get("plan")
+        if not isinstance(raw_plan, dict):
+            raise WorkflowConflict("The saved plan is invalid.")
+        try:
+            plan_document = PlanDocument.model_validate(raw_plan)
+        except ValidationError as error:
+            raise WorkflowConflict("The saved plan is invalid.") from error
+        task_rows = await TaskRepository(self._session).create_from_plan(
+            user_id, run_id, plan_document
+        )
+        if task_rows is None:
+            raise LookupError("Run not found.")
+        tasks_event = await self._bus.persist(
+            self._session,
+            user_id,
+            run_id,
+            event_type="task.updated",
+            payload={"count": len(task_rows), "status": "pending"},
+        )
         approved_event = await self._bus.persist(
             self._session,
             user_id,
@@ -438,7 +765,7 @@ class PlanService:
             self._session, user_id, run, "EXECUTING", event_bus=self._bus
         )
         await self._session.commit()
-        events = await _refresh_events(self._session, [approved_event, state_event])
+        events = await _refresh_events(self._session, [tasks_event, approved_event, state_event])
         await _publish_all(self._bus, events)
         return run
 
@@ -449,3 +776,135 @@ async def advance_run_job(user_id: UUID, run_id: UUID, llm_client: LLMClient) ->
         return await RunOrchestrator(llm_client).advance_until_input(user_id, run_id)
     except (IllegalRunTransition, LookupError):
         raise
+
+
+async def resume_approval_job(
+    user_id: UUID,
+    run_id: UUID,
+    approval_id: UUID,
+    llm_client: LLMClient,
+    event_bus: EventBus | None = None,
+) -> ToolExecutionResult:
+    """Resume a resolved tool and ask the requesting agent to replan on rejection."""
+    bus = event_bus or EventBus()
+    result = await ToolExecutionPipeline(
+        SessionFactory, agent_tool_registry(), bus
+    ).resume_approval(user_id, run_id, approval_id)
+    if result.output is not None and result.output.get("status") == "rejected":
+        await _replan_after_rejection(user_id, run_id, approval_id, result, llm_client, bus)
+    if result.status == "completed":
+        await enqueue_advance(user_id, run_id)
+    return result
+
+
+async def _replan_after_rejection(
+    user_id: UUID,
+    run_id: UUID,
+    approval_id: UUID,
+    tool_result: ToolExecutionResult,
+    llm_client: LLMClient,
+    event_bus: EventBus,
+) -> None:
+    """Persist one bounded follow-up LLM step with structured rejection feedback."""
+    if tool_result.output is None:
+        return
+    async with SessionFactory() as session:
+        approval = await ApprovalRepository(session).get_for_user(user_id, approval_id)
+        run = await RunRepository(session).get_for_user(user_id, run_id)
+        if approval is None or run is None or approval.agent_id is None:
+            return
+        agent = await AgentRepository(session).get_for_id(user_id, approval.agent_id)
+        if agent is None:
+            return
+        steps = await AgentRepository(session).list_steps_for_agent(user_id, agent.id)
+        if not steps or steps[-1].kind == "llm":
+            return
+        llm_step = next((step for step in reversed(steps) if step.kind == "llm"), None)
+        if llm_step is None:
+            return
+        execution = (
+            await ToolExecutionRepository(session).get_for_key(
+                user_id, run_id, approval.idempotency_key
+            )
+            if approval.idempotency_key is not None
+            else None
+        )
+        if execution is None:
+            return
+        raw_messages = llm_step.payload.get("input_messages")
+        raw_calls = llm_step.payload.get("tool_calls")
+        if not isinstance(raw_messages, list) or not isinstance(raw_calls, list):
+            return
+        messages = [dict(message) for message in raw_messages if isinstance(message, dict)]
+        call_id = next(
+            (
+                str(call.get("id"))
+                for call in raw_calls
+                if isinstance(call, dict)
+                and call.get("name") == execution.tool_name
+                and call.get("arguments") == execution.input_payload
+            ),
+            None,
+        )
+        if call_id is None:
+            return
+        config = agent.config
+        raw_allowlist = config.get("tool_allowlist", [])
+        tool_allowlist = (
+            tuple(item for item in raw_allowlist if isinstance(item, str))
+            if isinstance(raw_allowlist, list)
+            else ()
+        )
+        raw_max_steps = config.get("max_steps", 1)
+        raw_max_cost = config.get("max_cost_usd", 0.5)
+        if isinstance(raw_max_cost, (str, int, float, Decimal)):
+            try:
+                max_cost = float(raw_max_cost)
+            except (ValueError, OverflowError):
+                max_cost = 0.5
+        else:
+            max_cost = 0.5
+        template = RoleTemplate(
+            name=agent.role,
+            system_prompt=str(config.get("system_prompt", "")),
+            model_tier=ModelTier(str(config.get("model_tier", ModelTier.BALANCED.value))),
+            tool_allowlist=tool_allowlist,
+            output_schema=str(config.get("output_schema", "")),
+            max_steps=raw_max_steps if isinstance(raw_max_steps, int) else 1,
+            max_cost_usd=max_cost,
+        )
+        keys = await ProviderKeyRepository(session).list_for_user(user_id)
+    provider_context = _provider_context(user_id, keys)
+    if provider_context is None:
+        return
+    provider, provider_key_id = provider_context
+    feedback_message = {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": execution.tool_name,
+                    "arguments": json.dumps(execution.input_payload),
+                },
+            }
+        ],
+    }
+    tool_message = {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": json.dumps(tool_result.output),
+    }
+    messages.extend([feedback_message, tool_message])
+    await AgentRuntime(SessionFactory, event_bus).complete(
+        user_id,
+        run_id,
+        provider,
+        provider_key_id,
+        template,
+        messages,
+        llm_client,
+        tool_registry=agent_tool_registry(),
+        force_new=True,
+    )

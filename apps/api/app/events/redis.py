@@ -21,5 +21,6 @@ async def close_redis() -> None:
     """Close Redis resources during API shutdown."""
     global _client
     if _client is not None:
-        await _client.close()
+        # Installed Redis stubs predate this runtime-supported async method.
+        await _client.aclose()  # type: ignore[attr-defined]
         _client = None

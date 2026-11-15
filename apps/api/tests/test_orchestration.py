@@ -1,28 +1,40 @@
 """Real-Postgres M3 orchestration tests using the deterministic FakeProvider."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+from app.agents.demo_tools import agent_tool_registry
 from app.agents.registry import ROLE_TEMPLATES
-from app.agents.runtime import AgentRuntime
-from app.agents.schemas import PlanDocument
+from app.agents.runtime import AgentRuntime, BudgetExceededError
+from app.agents.schemas import PlanDocument, TaskResult
 from app.api.v1.deps import get_llm_client
 from app.core.config import get_settings
 from app.core.db import SessionFactory
 from app.events.bus import EventBus
 from app.llm.client import LLMClient
+from app.llm.fake import DevelopmentFakeKeyResolver, FakeProvider
 from app.llm.key_resolver import RepositoryProviderKeyResolver
-from app.llm.types import Provider
+from app.llm.types import LLMResponse, Provider
 from app.models.event import Event
 from app.models.run import Run
+from app.models.task import Task
 from app.orchestrator.state import transition_run
+from app.repos.agents import AgentRepository
 from app.repos.events import EventRepository
 from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
-from app.services.orchestration import PlanService, QuestionService, advance_run_job
+from app.repos.tasks import TaskRepository
+from app.services.orchestration import (
+    PlanService,
+    QuestionService,
+    RunOrchestrator,
+    advance_run_job,
+)
 from app.services.runs import RunService
 from tests.conftest import WEB_ORIGIN
 
@@ -119,14 +131,26 @@ def test_fake_provider_flow_emits_exact_events_through_plan_approval(
     assert event_types == [
         "run.state_changed",
         "run.state_changed",
+        "agent.spawned",
+        "agent.status",
         "agent.step_completed",
+        "cost.updated",
+        "agent.tool_call",
+        "agent.tool_result",
+        "agent.status",
         "question.asked",
         "run.state_changed",
         "question.answered",
         "run.state_changed",
+        "agent.spawned",
+        "agent.status",
+        "agent.message",
         "agent.step_completed",
+        "cost.updated",
+        "agent.status",
         "plan.created",
         "run.state_changed",
+        "task.updated",
         "plan.approved",
         "run.state_changed",
     ]
@@ -154,11 +178,281 @@ def test_autopilot_auto_approves_plan_and_records_event(
     assert advance(api_client, user_id, run_id, llm) == "EXECUTING"
     events = get_events(api_client, user_id, run_id)
     assert [event.type for event in events][-3:] == [
-        "plan.created",
+        "task.updated",
         "plan.auto_approved",
         "run.state_changed",
     ]
     assert events[-1].payload["plan_auto_approved"] is True
+
+
+def test_task_scheduler_claims_ready_dependencies_and_blocks_failed_dependents(
+    api_client: TestClient, test_emails: Callable[[], str]
+) -> None:
+    user_id, run_id = create_user_and_run(api_client, test_emails())
+    plan = make_plan()
+    plan["tasks"] = [
+        {"id": "first", "title": "First", "description": "Start."},
+        {
+            "id": "second",
+            "title": "Second",
+            "description": "Depends on first.",
+            "depends_on": ["first"],
+        },
+        {"id": "parallel", "title": "Parallel", "description": "Can start immediately."},
+    ]
+
+    async def exercise_graph() -> tuple[list[str], list[str]]:
+        async with SessionFactory() as session:
+            tasks = await TaskRepository(session).create_from_plan(
+                user_id, run_id, PlanDocument.model_validate(plan)
+            )
+            assert tasks is not None
+            await session.commit()
+        async with SessionFactory() as session:
+            batch = await TaskRepository(session).claim_ready(user_id, run_id, 4)
+            assert batch is not None
+            ready, _, _ = batch
+            ready_ids = [task.external_id for task in ready]
+            first = next(task for task in ready if task.external_id == "first")
+            await TaskRepository(session).finish(
+                user_id, run_id, first.id, "failed", {"reason": "scripted failure"}
+            )
+            await session.commit()
+        async with SessionFactory() as session:
+            batch = await TaskRepository(session).claim_ready(user_id, run_id, 4)
+            assert batch is not None
+            _, blocked, _ = batch
+            blocked_ids = [task.external_id for task in blocked]
+            await session.commit()
+        return ready_ids, blocked_ids
+
+    ready_ids, blocked_ids = api_client.portal.call(exercise_graph)
+    assert "first" in ready_ids
+    assert "parallel" in ready_ids
+    assert "second" not in ready_ids
+    assert blocked_ids == ["second"]
+
+
+def test_fake_provider_scheduler_runs_parallel_roots_before_dependent(
+    api_client: TestClient,
+    test_emails: Callable[[], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_PROVIDER_ENABLED", "true")
+    get_settings.cache_clear()
+    user_id, run_id = create_user_and_run(api_client, test_emails())
+    plan = PlanDocument.model_validate(
+        {
+            **make_plan(),
+            "tasks": [
+                {"id": "root_a", "title": "Root A", "description": "First root."},
+                {"id": "root_b", "title": "Root B", "description": "Second root."},
+                {
+                    "id": "dependent",
+                    "title": "Dependent",
+                    "description": "Wait for both roots.",
+                    "depends_on": ["root_a", "root_b"],
+                },
+            ],
+        }
+    )
+
+    async def prepare_tasks() -> None:
+        async with SessionFactory() as session:
+            run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
+            assert run is not None
+            run.status = "EXECUTING"
+            assert await TaskRepository(session).create_from_plan(user_id, run_id, plan)
+            await session.commit()
+
+    api_client.portal.call(prepare_tasks)
+
+    async def persist_worker_step() -> UUID:
+        template = ROLE_TEMPLATES["coder"]
+        config = {
+            "name": template.name,
+            "system_prompt": template.system_prompt,
+            "model_tier": template.model_tier.value,
+            "tool_allowlist": list(template.tool_allowlist),
+            "output_schema": template.output_schema,
+            "max_steps": template.max_steps,
+            "max_cost_usd": template.max_cost_usd,
+        }
+        async with SessionFactory() as session:
+            task = await session.scalar(
+                select(Task).where(
+                    Task.run_id == run_id,
+                    Task.external_id == "root_a",
+                )
+            )
+            assert task is not None
+            agent = await AgentRepository(session).get_or_create_for_task(
+                user_id, run_id, "coder", task.id, config
+            )
+            assert agent is not None
+            task.agent_id = agent.id
+            task.status = "running"
+            await session.commit()
+            agent_id = agent.id
+
+        response = LLMResponse(
+            provider=Provider.OPENAI,
+            model="fake-model",
+            content=TaskResult(status="completed", summary="Recovered root.").model_dump_json(),
+            cost_usd=Decimal("0.01"),
+        )
+        fake = FakeProvider([response])
+        client = LLMClient(
+            DevelopmentFakeKeyResolver(), providers={Provider.OPENAI: fake}, max_retries=0
+        )
+
+        async def no_spawn(payload: Mapping[str, object], call_key: str) -> Mapping[str, object]:
+            del payload, call_key
+            return {}
+
+        registry = agent_tool_registry(spawn_handler=no_spawn)
+        key_id = uuid5(NAMESPACE_URL, f"forge-fake:{user_id}")
+        await AgentRuntime(SessionFactory).complete(
+            user_id,
+            run_id,
+            Provider.OPENAI,
+            key_id,
+            template,
+            [
+                {"role": "system", "content": template.system_prompt},
+                {"role": "user", "content": f"Agent ID: {agent_id}\nTask: Root A"},
+            ],
+            client,
+            tool_registry=registry,
+            agent_id=agent_id,
+        )
+        return agent_id
+
+    recovered_agent_id = api_client.portal.call(persist_worker_step)
+    scripted = [
+        LLMResponse(
+            provider=Provider.OPENAI,
+            model="fake-model",
+            content=TaskResult(status="completed", summary=f"Result {index}").model_dump_json(),
+            cost_usd=Decimal("0.01"),
+        )
+        for index in range(2)
+    ]
+    fake = FakeProvider(scripted)
+    llm = LLMClient(DevelopmentFakeKeyResolver(), providers={Provider.OPENAI: fake}, max_retries=0)
+    orchestrator = RunOrchestrator(llm)
+    assert api_client.portal.call(orchestrator.advance_until_input, user_id, run_id) == (
+        "EXECUTING"
+    )
+
+    async def read_statuses() -> list[tuple[str, str]]:
+        async with SessionFactory() as session:
+            tasks = await TaskRepository(session).list_for_run(user_id, run_id)
+            assert tasks is not None
+            return [(task.external_id, task.status) for task in tasks]
+
+    assert {status for _, status in api_client.portal.call(read_statuses)} == {"completed"}
+    assert len(fake.messages) == 2
+
+    async def recovered_step_count() -> int:
+        async with SessionFactory() as session:
+            return len(
+                await AgentRepository(session).list_steps_for_agent(user_id, recovered_agent_id)
+            )
+
+    assert api_client.portal.call(recovered_step_count) == 1
+
+
+def test_budget_caps_stop_calls_and_emit_warning_at_eighty_percent(
+    api_client: TestClient,
+    test_emails: Callable[[], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_PROVIDER_ENABLED", "true")
+    get_settings.cache_clear()
+    user_id, warning_run_id = create_user_and_run(api_client, test_emails(), budget="1.00")
+
+    async def set_planning() -> None:
+        async with SessionFactory() as session:
+            run = await RunRepository(session).get_for_user(user_id, warning_run_id, lock=True)
+            assert run is not None
+            run.status = "PLANNING"
+            await session.commit()
+
+    api_client.portal.call(set_planning)
+    response = LLMResponse(
+        provider=Provider.OPENAI,
+        model="fake-model",
+        content="A concise plan summary.",
+        cost_usd=Decimal("0.80"),
+    )
+    fake = FakeProvider([response])
+    llm = LLMClient(DevelopmentFakeKeyResolver(), providers={Provider.OPENAI: fake}, max_retries=0)
+    template = ROLE_TEMPLATES["planner"]
+    key_id = uuid5(NAMESPACE_URL, f"forge-fake:{user_id}")
+    runtime = AgentRuntime(SessionFactory)
+
+    async def record_warning() -> list[Event]:
+        await runtime.complete(
+            user_id,
+            warning_run_id,
+            Provider.OPENAI,
+            key_id,
+            template,
+            [{"role": "user", "content": "Plan."}],
+            llm,
+        )
+        async with SessionFactory() as session:
+            return await EventRepository(session).list_after(user_id, warning_run_id, 0, limit=500)
+
+    events = api_client.portal.call(record_warning)
+    warnings = [event.payload for event in events if event.type == "budget.warning"]
+    assert {warning["scope"] for warning in warnings} == {"run", "agent"}
+
+    async def at_cap() -> None:
+        async with SessionFactory() as session:
+            run = await RunRepository(session).get_for_user(user_id, warning_run_id)
+            assert run is not None
+            run.spent_usd = run.budget_usd
+            agent = await AgentRepository(session).get_for_role(
+                user_id, warning_run_id, template.name
+            )
+            assert agent is not None
+            await session.commit()
+        with pytest.raises(BudgetExceededError):
+            await runtime.complete(
+                user_id,
+                warning_run_id,
+                Provider.OPENAI,
+                key_id,
+                template,
+                [{"role": "user", "content": "One more call."}],
+                llm,
+                force_new=True,
+            )
+        async with SessionFactory() as session:
+            run = await RunRepository(session).get_for_user(user_id, warning_run_id)
+            agent = await AgentRepository(session).get_for_role(
+                user_id, warning_run_id, template.name
+            )
+            assert run is not None and agent is not None
+            run.spent_usd = Decimal("0")
+            agent.spent_usd = Decimal(str(template.max_cost_usd))
+            await session.commit()
+        with pytest.raises(BudgetExceededError):
+            await runtime.complete(
+                user_id,
+                warning_run_id,
+                Provider.OPENAI,
+                key_id,
+                template,
+                [{"role": "user", "content": "Agent budget is exhausted."}],
+                llm,
+                force_new=True,
+            )
+
+    api_client.portal.call(at_cap)
+    assert len(fake.messages) == 1
 
 
 def test_missing_provider_key_fails_run_with_clear_event(

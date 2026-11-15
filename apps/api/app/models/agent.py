@@ -10,7 +10,6 @@ from sqlalchemy import (
     ForeignKey,
     Numeric,
     String,
-    UniqueConstraint,
     func,
     text,
 )
@@ -26,9 +25,9 @@ class Agent(Base):
 
     __tablename__ = "agents"
     __table_args__ = (
-        UniqueConstraint("run_id", "role", name="uq_agents_run_role"),
         CheckConstraint(
-            "status IN ('created', 'running', 'completed', 'failed')", name="ck_agents_status"
+            "status IN ('created', 'running', 'completed', 'failed', 'interrupted')",
+            name="ck_agents_status",
         ),
     )
 

@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, type RunEvent } from "@/lib/api";
+import { api, type Approval, type RunEvent } from "@/lib/api";
 import RunPage from "./page";
 
 const stream = vi.hoisted(() => ({
@@ -32,6 +32,9 @@ describe("run clarification and plan interface", () => {
       status: "AWAITING_ANSWERS",
       created_at: "2026-11-08T00:00:00Z",
     });
+    vi.spyOn(api, "runApprovals").mockResolvedValue([]);
+    vi.spyOn(api, "runAgents").mockResolvedValue([]);
+    vi.spyOn(api, "runTasks").mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -208,5 +211,102 @@ describe("run clarification and plan interface", () => {
     expect((await screen.findByRole("alert")).textContent).toContain(
       "This run is not waiting for answers.",
     );
+  });
+
+  it("renders approval payload controls and changes autonomy", async () => {
+    const approval: Approval = {
+      id: "approval-1",
+      run_id: "run-1",
+      agent_id: "agent-1",
+      action_type: "demo_sandbox_write",
+      risk: "sandbox_write",
+      payload: { path: "index.html", content: "Hello" },
+      reason: "Write the requested page.",
+      estimated_cost_usd: "0.010000",
+      rollback_info: { action: "remove index.html" },
+      status: "pending",
+      edited_payload: null,
+      decided_at: null,
+      created_at: "2026-11-08T00:00:00Z",
+    };
+    vi.mocked(api.runApprovals).mockResolvedValue([approval]);
+    vi.spyOn(api, "decideApproval").mockResolvedValue({ approval, feedback: null });
+    vi.spyOn(api, "updateRunAutonomy").mockResolvedValue({
+      id: "run-1", project_id: "project-1", idea: "Build a journal",
+      autonomy_level: "milestones", budget_usd: "25.00", status: "EXECUTING",
+      created_at: "2026-11-08T00:00:00Z",
+    });
+
+    render(<RunPage />);
+    expect(await screen.findByText("Write the requested page.")).toBeTruthy();
+    expect(screen.getAllByText(/"path": "index\.html"/).length).toBeGreaterThan(0);
+    const editor = screen.getByRole("textbox", { name: "Edit payload for demo_sandbox_write" });
+    fireEvent.change(editor, { target: { value: JSON.stringify({ path: "home.html" }) } });
+    fireEvent.click(screen.getByRole("button", { name: "Save edited payload" }));
+    await waitFor(() => expect(api.decideApproval).toHaveBeenCalledWith(
+      "approval-1", "edit", { path: "home.html" },
+    ));
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Autonomy level" }), {
+      target: { value: "milestones" },
+    });
+    await waitFor(() => expect(api.updateRunAutonomy).toHaveBeenCalledWith("run-1", "milestones"));
+  });
+
+  it("shows readable errors from approval decisions", async () => {
+    const approval: Approval = {
+      id: "approval-2", run_id: "run-1", agent_id: null,
+      action_type: "demo_irreversible", risk: "irreversible", payload: { target: "prod" },
+      reason: "Deploy the app.", estimated_cost_usd: null, rollback_info: null,
+      status: "pending", edited_payload: null, decided_at: null,
+      created_at: "2026-11-08T00:00:00Z",
+    };
+    vi.mocked(api.runApprovals).mockResolvedValue([approval]);
+    vi.spyOn(api, "decideApproval").mockRejectedValue(new Error("This approval has already been decided."));
+    render(<RunPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "This approval has already been decided.",
+    );
+  });
+
+  it("renders the agent tree, task list, cost meter and run controls", async () => {
+    stream.events = [{
+      id: "cost-1", run_id: "run-1", seq: 8, type: "cost.updated",
+      payload: { run_spent_usd: "1.250000" }, created_at: "2026-11-08T00:00:00Z",
+    }];
+    vi.mocked(api.runAgents).mockResolvedValue([{
+      id: "agent-1", run_id: "run-1", parent_id: null, role: "coder",
+      status: "running", model: "fake-model", spent_usd: "0.750000",
+    }]);
+    vi.mocked(api.runTasks).mockResolvedValue([{
+      id: "task-1", external_id: "page", agent_id: "agent-1", title: "Build page",
+      description: "Create the first page.", status: "running", depends_on: [], output: null,
+    }]);
+    vi.spyOn(api, "pauseRun").mockResolvedValue({
+      id: "run-1", project_id: "project-1", idea: "Build a journal",
+      autonomy_level: "step_by_step", budget_usd: "25.00", status: "PAUSED",
+      created_at: "2026-11-08T00:00:00Z",
+    });
+    vi.spyOn(api, "messageRun").mockResolvedValue(undefined);
+
+    render(<RunPage />);
+    expect(await screen.findByText("coder · running")).toBeTruthy();
+    expect((await screen.findByText("Build page")).closest("li")?.textContent).toContain(
+      "Build page · running",
+    );
+    expect(screen.getByLabelText("Run cost").textContent).toContain("1.250000");
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    await waitFor(() => expect(api.pauseRun).toHaveBeenCalledWith("run-1"));
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Message the run or an agent" }),
+      {
+        target: { value: "Keep the page compact." },
+      },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(api.messageRun).toHaveBeenCalledWith(
+      "run-1", "Keep the page compact.", undefined,
+    ));
   });
 });
