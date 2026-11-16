@@ -179,6 +179,7 @@ All user-owned rows are scoped by `user_id`; every query goes through a reposito
 - `GET|POST|DELETE /provider-keys` (write-only: never return plaintext; `POST /provider-keys/{id}/test`)
 - `GET /integrations`, `POST /integrations/{kind}/connect` (OAuth or token), `DELETE /integrations/{id}`
 - `POST /runs` (idea, autonomy_level, budget_usd, model_prefs), `GET /runs`, `GET /runs/{id}`
+- `GET /runs/{id}/files`, `GET /runs/{id}/files/content?path=`, `GET /runs/{id}/diff` (authenticated, run-owner scoped; available while the sandbox is active)
 - `POST /runs/{id}/answers`, `POST /runs/{id}/messages`, `PUT /runs/{id}/plan`
 - `POST /runs/{id}/pause|resume|cancel`
 - `GET /runs/{id}/approvals`, `POST /approvals/{id}/decide` (approve|reject|edit)

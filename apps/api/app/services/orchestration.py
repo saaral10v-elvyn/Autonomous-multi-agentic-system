@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -37,6 +38,8 @@ from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
 from app.repos.tasks import TaskRepository
 from app.repos.tool_executions import ToolExecutionRepository
+from app.sandbox.lifecycle import destroy_run_sandbox
+from app.sandbox.registry import sandbox_handlers
 from app.services.spawning import AgentSpawner
 from app.services.tools import ToolExecutionPipeline, ToolExecutionResult
 
@@ -81,7 +84,7 @@ async def _mark_failed(user_id: UUID, run_id: UUID, message: str) -> None:
     bus = EventBus()
     async with SessionFactory() as session:
         run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
-        if run is None or run.status in {"FAILED", "CANCELLED", "EXECUTING"}:
+        if run is None or run.status in {"FAILED", "CANCELLED", "COMPLETED"}:
             return
         event = await stage_transition(
             session,
@@ -105,6 +108,28 @@ async def _mark_failed(user_id: UUID, run_id: UUID, message: str) -> None:
             await session.refresh(failure_event)
             events.append(failure_event)
     await _publish_all(bus, events)
+    await destroy_run_sandbox(run_id)
+
+
+async def _mark_completed(user_id: UUID, run_id: UUID) -> None:
+    bus = EventBus()
+    async with SessionFactory() as session:
+        run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
+        if run is None or run.status != "EXECUTING":
+            return
+        run.completed_at = datetime.now(UTC)
+        state = await stage_transition(session, user_id, run, "COMPLETED", event_bus=bus)
+        completed = await bus.persist(
+            session, user_id, run_id, event_type="run.completed", payload={"status": "COMPLETED"}
+        )
+        await session.commit()
+        await session.refresh(state)
+        events = [state]
+        if completed is not None:
+            await session.refresh(completed)
+            events.append(completed)
+    await _publish_all(bus, events)
+    await destroy_run_sandbox(run_id)
 
 
 class RunOrchestrator:
@@ -275,6 +300,20 @@ class RunOrchestrator:
                 committed_events = await _refresh_events(session, pending_events)
             await _publish_all(self._bus, committed_events)
             if not assignments:
+                async with SessionFactory() as session:
+                    final_tasks = await TaskRepository(session).list_for_run(user_id, run_id)
+                if final_tasks is not None and all(
+                    task.status == "completed" for task in final_tasks
+                ):
+                    await _mark_completed(user_id, run_id)
+                    return "COMPLETED"
+                if final_tasks and all(
+                    task.status in {"failed", "blocked", "interrupted"} for task in final_tasks
+                ):
+                    await _mark_failed(
+                        user_id, run_id, "All remaining tasks failed or were blocked."
+                    )
+                    return "FAILED"
                 return "EXECUTING"
             outcomes = await asyncio.gather(
                 *(
@@ -313,7 +352,10 @@ class RunOrchestrator:
         from app.agents.schemas import TaskResult
 
         spawner = AgentSpawner(SessionFactory, self._llm, provider, provider_key_id, self._bus)
-        registry = agent_tool_registry(spawn_handler=spawner.handler(user_id, run_id, agent_id))
+        registry = agent_tool_registry(
+            spawn_handler=spawner.handler(user_id, run_id, agent_id),
+            extra_handlers=await sandbox_handlers(user_id, run_id, agent_id, self._bus),
+        )
         try:
             result = await self._runtime.run_task(
                 user_id,
@@ -787,8 +829,13 @@ async def resume_approval_job(
 ) -> ToolExecutionResult:
     """Resume a resolved tool and ask the requesting agent to replan on rejection."""
     bus = event_bus or EventBus()
+    async with SessionFactory() as session:
+        approval = await ApprovalRepository(session).get_for_user(user_id, approval_id)
+        if approval is None or approval.run_id != run_id or approval.agent_id is None:
+            raise LookupError("Approval not found.")
+        extra = await sandbox_handlers(user_id, run_id, approval.agent_id, bus)
     result = await ToolExecutionPipeline(
-        SessionFactory, agent_tool_registry(), bus
+        SessionFactory, agent_tool_registry(extra_handlers=extra), bus
     ).resume_approval(user_id, run_id, approval_id)
     if result.output is not None and result.output.get("status") == "rejected":
         await _replan_after_rejection(user_id, run_id, approval_id, result, llm_client, bus)
@@ -905,6 +952,8 @@ async def _replan_after_rejection(
         template,
         messages,
         llm_client,
-        tool_registry=agent_tool_registry(),
+        tool_registry=agent_tool_registry(
+            extra_handlers=await sandbox_handlers(user_id, run_id, execution.agent_id, event_bus)
+        ),
         force_new=True,
     )

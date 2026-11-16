@@ -19,6 +19,7 @@ from app.models.event import Event
 from app.models.task import Task
 from app.repos.agents import AgentRepository
 from app.repos.runs import RunRepository
+from app.sandbox.registry import sandbox_handlers
 
 MAX_AGENT_DEPTH = 3
 MAX_CONCURRENT_AGENTS = 4
@@ -199,7 +200,10 @@ class AgentSpawner:
                 await session.refresh(event)
         for event in committed:
             await self._bus.publish(event)
-        registry = agent_tool_registry(spawn_handler=self.handler(user_id, run_id, agent.id))
+        registry = agent_tool_registry(
+            spawn_handler=self.handler(user_id, run_id, agent.id),
+            extra_handlers=await sandbox_handlers(user_id, run_id, agent.id, self._bus),
+        )
         child_prompt = f"Task: {task_text.strip()}\nContext references: {raw_refs}"
         result = await self._runtime.run_task(
             user_id,

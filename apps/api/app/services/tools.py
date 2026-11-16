@@ -6,11 +6,13 @@ from decimal import Decimal
 from hashlib import sha256
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.tools import ToolHandler, ToolRegistry
 from app.events.bus import EventBus
 from app.gate.engine import GateDecision, decide
+from app.models.agent import Agent
 from app.models.event import Event
 from app.models.tool_execution import ToolExecution
 from app.orchestrator.state import IllegalRunTransition, stage_transition
@@ -66,6 +68,30 @@ class ToolExecutionPipeline:
             run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
             if run is None:
                 raise LookupError("Run not found.")
+            if tool_name == "finish" and request_payload.get("status") == "completed":
+                role = await session.scalar(
+                    select(Agent.role).where(Agent.id == agent_id, Agent.run_id == run_id)
+                )
+                if role == "tester" and not await _tester_report_passed(session, run_id, agent_id):
+                    raise IllegalRunTransition(
+                        "Tester cannot complete successfully without a passing report "
+                        "for its latest executed command."
+                    )
+            if definition.requires_reviewer_pass and not await _reviewer_passed(session, run_id):
+                request = await self._bus.persist(
+                    session,
+                    user_id,
+                    run_id,
+                    event_type="review.requested",
+                    payload={"agent_id": str(agent_id), "required_for_tool": tool_name},
+                )
+                await session.commit()
+                if request is not None:
+                    await session.refresh(request)
+                    await self._bus.publish(request)
+                raise IllegalRunTransition(
+                    "A passing Reviewer result is required before this tool."
+                )
             if run.status == "AWAITING_APPROVAL":
                 approval = await ApprovalRepository(session).get_for_idempotency_key(
                     user_id, run_id, call_key
@@ -378,6 +404,81 @@ def _validate_replay(
     """Reject accidental reuse of one call ID for a different action."""
     if execution.tool_name != tool_name or execution.input_payload != dict(payload):
         raise ValueError("Tool idempotency key was reused with different action data.")
+
+
+async def _reviewer_passed(session: AsyncSession, run_id: UUID) -> bool:
+    result = await session.scalars(
+        select(Event)
+        .where(
+            Event.run_id == run_id,
+            Event.type.in_(("review.requested", "review.completed")),
+        )
+        .order_by(Event.seq.desc())
+        .limit(1)
+    )
+    event = result.first()
+    if event is None or event.type != "review.completed" or event.payload.get("passed") is not True:
+        return False
+    raw_agent_id = event.payload.get("agent_id")
+    if not isinstance(raw_agent_id, str):
+        return False
+    try:
+        agent_id = UUID(raw_agent_id)
+    except ValueError:
+        return False
+    reviewer = await session.scalar(
+        select(Agent.id).where(
+            Agent.id == agent_id, Agent.run_id == run_id, Agent.role == "reviewer"
+        )
+    )
+    return _is_passing_reviewer(event.payload, "reviewer" if reviewer is not None else None)
+
+
+def _is_passing_reviewer(payload: Mapping[str, object], role: str | None) -> bool:
+    """Accept a positive completion only when its author has the Reviewer role."""
+    return role == "reviewer" and payload.get("passed") is True
+
+
+async def _tester_report_passed(session: AsyncSession, run_id: UUID, agent_id: UUID) -> bool:
+    report = await session.scalar(
+        select(ToolExecution)
+        .where(
+            ToolExecution.run_id == run_id,
+            ToolExecution.agent_id == agent_id,
+            ToolExecution.tool_name == "tester_report",
+            ToolExecution.status == "completed",
+        )
+        .order_by(ToolExecution.completed_at.desc(), ToolExecution.created_at.desc())
+        .limit(1)
+    )
+    if report is None or not isinstance(report.output_payload, dict):
+        return False
+    latest_execution = await session.scalar(
+        select(ToolExecution)
+        .where(
+            ToolExecution.run_id == run_id,
+            ToolExecution.agent_id == agent_id,
+            ToolExecution.tool_name == "sandbox_exec",
+            ToolExecution.status == "completed",
+        )
+        .order_by(ToolExecution.completed_at.desc(), ToolExecution.created_at.desc())
+        .limit(1)
+    )
+    if latest_execution is None or not isinstance(latest_execution.output_payload, dict):
+        return False
+    output = report.output_payload
+    passed = output.get("passed")
+    skipped = output.get("skipped")
+    if type(passed) is not int or type(skipped) is not int:
+        return False
+    return (
+        output.get("source_execution_id") == str(latest_execution.id)
+        and output.get("exit_code") == 0
+        and output.get("failed") == 0
+        and passed + skipped > 0
+        and latest_execution.output_payload.get("exit_code") == 0
+        and latest_execution.output_payload.get("timed_out") is not True
+    )
 
 
 async def _refresh_events(session: AsyncSession, events: list[Event]) -> list[Event]:

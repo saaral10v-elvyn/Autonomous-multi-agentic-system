@@ -20,6 +20,7 @@ class ToolDefinition:
     parameters: dict[str, object] = field(
         default_factory=lambda: {"type": "object", "additionalProperties": True}
     )
+    requires_reviewer_pass: bool = False
 
 
 class ToolRegistry:
@@ -36,6 +37,7 @@ class ToolRegistry:
         risk: RiskClass | str | None = None,
         description: str = "",
         parameters: Mapping[str, object] | None = None,
+        requires_reviewer_pass: bool = False,
     ) -> ToolDefinition:
         """Register a tool only when its risk is explicitly supplied."""
         if risk is None:
@@ -52,6 +54,7 @@ class ToolRegistry:
             dict(parameters)
             if parameters is not None
             else {"type": "object", "additionalProperties": True},
+            requires_reviewer_pass,
         )
         self._tools[name] = definition
         return definition

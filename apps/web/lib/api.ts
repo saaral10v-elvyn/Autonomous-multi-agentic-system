@@ -57,6 +57,10 @@ export type RunEvent = {
   payload: Record<string, unknown>;
   created_at: string;
 };
+export type SandboxFileEntry = { path: string; name: string; type: "file" | "directory" };
+export type SandboxFileTree = { files: SandboxFileEntry[] };
+export type SandboxFileContent = { path: string; content: string };
+export type SandboxDiff = { diff: string };
 export type Agent = {
   id: string;
   run_id: string;
@@ -138,6 +142,9 @@ export const api = {
   run: (id: string) => request<Run>(`/runs/${id}`),
   runAgents: (id: string) => request<Agent[]>(`/runs/${id}/agents`),
   runTasks: (id: string) => request<RunTask[]>(`/runs/${id}/tasks`),
+  runFiles: (id: string) => request<SandboxFileTree>(`/runs/${id}/files`),
+  runFileContent: (id: string, path: string) => request<SandboxFileContent>(`/runs/${id}/files/content?path=${encodeURIComponent(path)}`),
+  runDiff: (id: string) => request<SandboxDiff>(`/runs/${id}/diff`),
   runEvents: (id: string, afterSeq: number) => request<RunEvent[]>(`/runs/${id}/events?after_seq=${afterSeq}`),
   submitRunAnswers: (id: string, answers: Record<string, unknown>) => request<Run>(`/runs/${id}/answers`, { method: "POST", body: JSON.stringify({ answers }) }),
   updateRunPlan: (id: string, plan: Plan) => request<Plan>(`/runs/${id}/plan`, { method: "PUT", body: JSON.stringify({ plan }) }),

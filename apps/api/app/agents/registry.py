@@ -45,21 +45,60 @@ ROLE_TEMPLATES = {
     ),
 }
 
-_DEMO_ALLOWLIST = ("demo_read", "demo_sandbox_write", "spawn_agent", "finish")
-for _role, _purpose, _tier in (
-    ("researcher", "Gather and summarize relevant information.", ModelTier.FAST),
-    ("architect", "Describe a concrete module and file design.", ModelTier.BALANCED),
-    ("coder", "Implement the assigned task safely.", ModelTier.BALANCED),
-    ("tester", "Review task behavior and report test findings.", ModelTier.FAST),
-    ("reviewer", "Review completed task output for correctness.", ModelTier.STRONG),
-    ("deployer", "Prepare a deployment readiness summary.", ModelTier.BALANCED),
-    ("reporter", "Summarize completed work and remaining follow-ups.", ModelTier.FAST),
+for _role, _purpose, _tier, _allowlist in (
+    (
+        "researcher",
+        "Gather and summarize relevant information.",
+        ModelTier.FAST,
+        ("demo_read", "spawn_agent", "finish"),
+    ),
+    (
+        "architect",
+        "Describe a concrete module and file design.",
+        ModelTier.BALANCED,
+        ("read_file", "write_file", "list_dir", "finish"),
+    ),
+    (
+        "coder",
+        "Implement the assigned task safely.",
+        ModelTier.BALANCED,
+        (
+            "sandbox_exec",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "git_init",
+            "git_status",
+            "git_diff",
+            "git_add",
+            "git_commit",
+            "git_branch",
+            "git_checkout",
+            "request_review",
+            "spawn_agent",
+            "finish",
+        ),
+    ),
+    (
+        "tester",
+        "Run tests via sandbox_exec and report structured results.",
+        ModelTier.FAST,
+        ("sandbox_exec", "read_file", "tester_report", "finish"),
+    ),
+    (
+        "reviewer",
+        "Review the sandbox diff and report using review_complete.",
+        ModelTier.STRONG,
+        ("read_file", "git_diff", "review_complete", "finish"),
+    ),
+    ("deployer", "Prepare deployment readiness.", ModelTier.BALANCED, ("finish",)),
+    ("reporter", "Summarize completed work.", ModelTier.FAST, ("finish",)),
 ):
     ROLE_TEMPLATES[_role] = RoleTemplate(
         name=_role,
         system_prompt=f"{_purpose} Use only registered tools and return structured JSON.",
         model_tier=_tier,
-        tool_allowlist=_DEMO_ALLOWLIST,
+        tool_allowlist=_allowlist,
         output_schema="TaskResult",
         max_steps=5,
         max_cost_usd=0.5,

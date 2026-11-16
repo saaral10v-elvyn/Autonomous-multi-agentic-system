@@ -19,11 +19,15 @@ from app.api.v1.schemas import (
     TaskResponse,
     UserMessageRequest,
 )
+from app.core.config import get_settings
 from app.orchestrator.state import IllegalRunTransition
 from app.repos.agents import AgentRepository
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
 from app.repos.tasks import TaskRepository
+from app.sandbox.base import SandboxHandle, SandboxProvider
+from app.sandbox.factory import get_sandbox_provider
+from app.sandbox.tools import sandbox_diff
 from app.services.approvals import ApprovalConflict, ApprovalService
 from app.services.orchestration import (
     InvalidAnswers,
@@ -36,6 +40,64 @@ from app.services.run_controls import RunControlService
 from app.services.runs import RunService
 
 router = APIRouter(prefix="/runs")
+
+
+async def _owned_sandbox(
+    user_id: UUID, run_id: UUID, session: DbSession
+) -> tuple[SandboxProvider, SandboxHandle]:
+    if await RunRepository(session).get_for_user(user_id, run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    provider = get_sandbox_provider()
+    handle = next(
+        (item for item in await provider.list_active() if item.run_id == str(run_id)), None
+    )
+    if handle is None:
+        raise HTTPException(status_code=404, detail="Sandbox not found.")
+    return provider, handle
+
+
+@router.get("/{run_id}/files")
+async def run_files(run_id: UUID, user: CurrentUser, session: DbSession) -> dict[str, object]:
+    provider, handle = await _owned_sandbox(user.id, run_id, session)
+    entries: list[dict[str, object]] = []
+
+    async def walk(path: str, depth: int = 0) -> None:
+        if depth > 12:
+            return
+        for name in await provider.list_dir(handle, path):
+            child = f"{path.rstrip('/')}/{name}"
+            try:
+                is_dir = await provider.is_dir(handle, child)
+            except (ValueError, LookupError, RuntimeError):
+                continue
+            entries.append({"path": child, "name": name, "type": "directory" if is_dir else "file"})
+            if is_dir:
+                await walk(child, depth + 1)
+
+    await walk("/workspace")
+    return {"files": entries}
+
+
+@router.get("/{run_id}/files/content")
+async def run_file_content(
+    run_id: UUID, path: str, user: CurrentUser, session: DbSession
+) -> dict[str, str]:
+    provider, handle = await _owned_sandbox(user.id, run_id, session)
+    try:
+        return {
+            "path": path,
+            "content": await provider.read_file(
+                handle, path, get_settings().sandbox_max_output_bytes
+            ),
+        }
+    except (ValueError, LookupError, RuntimeError):
+        raise HTTPException(status_code=404, detail="File not found.") from None
+
+
+@router.get("/{run_id}/diff")
+async def run_diff(run_id: UUID, user: CurrentUser, session: DbSession) -> dict[str, str]:
+    provider, handle = await _owned_sandbox(user.id, run_id, session)
+    return {"diff": await sandbox_diff(provider, handle, get_settings().sandbox_max_output_bytes)}
 
 
 @router.post("", response_model=RunResponse, status_code=status.HTTP_201_CREATED)

@@ -23,3 +23,43 @@ class ArtifactRepository:
             .order_by(Artifact.created_at, Artifact.id)
         )
         return list(result.scalars().all())
+
+    async def save_tester_result_for_user(
+        self, user_id: UUID, run_id: UUID, result: dict[str, object]
+    ) -> tuple[Artifact | None, bool]:
+        artifact = await self._session.scalar(
+            select(Artifact)
+            .join(Run, Run.id == Artifact.run_id)
+            .where(
+                Run.user_id == user_id,
+                Run.id == run_id,
+                Artifact.kind == "test_result",
+                Artifact.name == "Tester results",
+            )
+            .order_by(Artifact.created_at.desc())
+            .limit(1)
+            .with_for_update()
+        )
+        if artifact is not None:
+            if artifact.meta.get("result") == result:
+                return artifact, False
+            artifact.meta = {"result": result}
+            await self._session.flush()
+            return artifact, True
+        if (
+            await self._session.scalar(
+                select(Run.id).where(Run.id == run_id, Run.user_id == user_id)
+            )
+            is None
+        ):
+            return None, False
+        artifact = Artifact(
+            run_id=run_id,
+            kind="test_result",
+            name="Tester results",
+            uri=f"sandbox://{run_id}/test-results.json",
+            meta={"result": result},
+        )
+        self._session.add(artifact)
+        await self._session.flush()
+        return artifact, True

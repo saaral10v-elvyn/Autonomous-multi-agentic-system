@@ -16,6 +16,7 @@ import {
   type RunTask,
 } from "@/lib/api";
 import { useRunStream } from "@/hooks/use-run-stream";
+import { SandboxPanel } from "./sandbox-panel";
 
 function isQuestion(value: unknown): value is RunQuestion {
   if (typeof value !== "object" || value === null) return false;
@@ -386,6 +387,9 @@ export default function RunPage() {
             className="rounded bg-slate-900 px-4 py-2 text-white"
           >Send message</button>
         </form>
+      </section>
+      <section className="space-y-3">
+        <SandboxPanel runId={runId} events={events} />
       </section>
       <section className="space-y-3">
         <h2 className="text-xl font-medium">Run activity</h2>

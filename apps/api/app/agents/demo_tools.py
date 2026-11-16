@@ -49,6 +49,7 @@ def agent_tool_registry(
     settings: Settings | None = None,
     *,
     spawn_handler: ToolHandler | None = None,
+    extra_handlers: Mapping[str, ToolHandler] | None = None,
 ) -> ToolRegistry:
     """Build the baseline workflow tool plus optional fake-provider demo tools."""
     active_settings = settings or get_settings()
@@ -114,6 +115,19 @@ def agent_tool_registry(
                 "required": ["role", "task", "parent_id"],
                 "additionalProperties": False,
             },
+        )
+    for name, handler in (extra_handlers or {}).items():
+        from app.sandbox.tools import register_sandbox_tools
+
+        temp = ToolRegistry()
+        register_sandbox_tools(temp, {name: handler})
+        definition = temp.get(name)
+        registry.register(
+            name,
+            handler,
+            risk=definition.risk,
+            description=definition.description,
+            requires_reviewer_pass=definition.requires_reviewer_pass,
         )
     for tool in demo_tool_registry(active_settings).list():
         registry.register(

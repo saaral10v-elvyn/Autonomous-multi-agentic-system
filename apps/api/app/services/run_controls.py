@@ -13,6 +13,7 @@ from app.models.task import Task
 from app.orchestrator.state import IllegalRunTransition, resume_run, transition_run
 from app.repos.agents import AgentRepository
 from app.repos.runs import RunRepository
+from app.sandbox.lifecycle import destroy_run_sandbox
 
 
 class RunControlService:
@@ -63,9 +64,9 @@ class RunControlService:
         return run
 
     async def cancel(self, user_id: UUID, run_id: UUID) -> Run:
-        return await transition_run(
-            self._session, user_id, run_id, "CANCELLED", event_bus=self._bus
-        )
+        run = await transition_run(self._session, user_id, run_id, "CANCELLED", event_bus=self._bus)
+        await destroy_run_sandbox(run_id)
+        return run
 
     async def interrupt(self, user_id: UUID, agent_id: UUID) -> Agent:
         agent = await AgentRepository(self._session).get_for_id(user_id, agent_id)
