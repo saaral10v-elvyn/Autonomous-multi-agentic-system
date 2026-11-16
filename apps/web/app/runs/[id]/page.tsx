@@ -9,6 +9,7 @@ import {
   type Approval,
   type ApprovalDecision,
   type AutonomyLevel,
+  type Integration,
   type Plan,
   type Run,
   type RunEvent,
@@ -55,6 +56,7 @@ export default function RunPage() {
   const { events, connected } = useRunStream(runId);
   const [run, setRun] = useState<Run | null>(null);
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [editedPayloads, setEditedPayloads] = useState<Record<string, string>>({});
   const [answers, setAnswers] = useState<Record<string, unknown>>({});
   const [planDraft, setPlanDraft] = useState("");
@@ -76,6 +78,10 @@ export default function RunPage() {
       setError(reason instanceof Error ? reason.message : "Could not load approvals."),
     );
   }, [runId, events]);
+
+  useEffect(() => {
+    void api.integrations().then(setIntegrations).catch(() => setIntegrations([]));
+  }, [runId]);
 
   useEffect(() => {
     void Promise.all([api.runAgents(runId), api.runTasks(runId)])
@@ -270,6 +276,7 @@ export default function RunPage() {
             <span className="rounded bg-slate-100 px-2 py-1 text-sm">{approval.risk} · {approval.status}</span>
           </div>
           <p>{approval.reason}</p>
+          {typeof approval.payload.integration_id === "string" && <p className="text-sm text-slate-600">Connected account: {integrations.find((item) => item.id === approval.payload.integration_id)?.account_label ?? "integration"}</p>}
           <p className="text-sm text-slate-600">Agent: {approval.agent_id ?? "run workflow"} · Estimated cost: {approval.estimated_cost_usd ? `$${approval.estimated_cost_usd}` : "Not provided"}</p>
           <div><h4 className="text-sm font-medium">Exact payload</h4><pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 p-3 text-sm">{JSON.stringify(approval.payload, null, 2)}</pre></div>
           {approval.rollback_info && <div><h4 className="text-sm font-medium">Rollback</h4><pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 p-3 text-sm">{JSON.stringify(approval.rollback_info, null, 2)}</pre></div>}

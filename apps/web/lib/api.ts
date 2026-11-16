@@ -61,6 +61,8 @@ export type SandboxFileEntry = { path: string; name: string; type: "file" | "dir
 export type SandboxFileTree = { files: SandboxFileEntry[] };
 export type SandboxFileContent = { path: string; content: string };
 export type SandboxDiff = { diff: string };
+export type IntegrationKind = "github" | "vercel";
+export type Integration = { id: string; kind: IntegrationKind; account_label: string; last4: string; created_at: string };
 export type Agent = {
   id: string;
   run_id: string;
@@ -137,6 +139,9 @@ export const api = {
   addProviderKey: (provider: Provider, label: string, api_key: string) => request<ProviderKey>("/provider-keys", { method: "POST", body: JSON.stringify({ provider, label, api_key }) }),
   testProviderKey: (id: string) => request<ProviderTest>(`/provider-keys/${id}/test`, { method: "POST" }),
   removeProviderKey: (id: string) => request<void>(`/provider-keys/${id}`, { method: "DELETE" }),
+  integrations: () => request<Integration[]>("/integrations"),
+  connectIntegration: (kind: IntegrationKind, account_label: string, token: string) => request<Integration>(`/integrations/${kind}/connect`, { method: "POST", body: JSON.stringify({ account_label, token }) }),
+  removeIntegration: (id: string) => request<void>(`/integrations/${id}`, { method: "DELETE" }),
   createRun: (idea: string, autonomy_level: AutonomyLevel, budget_usd: number) => request<Run>("/runs", { method: "POST", body: JSON.stringify({ idea, autonomy_level, budget_usd }) }),
   runs: () => request<Run[]>("/runs"),
   run: (id: string) => request<Run>(`/runs/${id}`),
