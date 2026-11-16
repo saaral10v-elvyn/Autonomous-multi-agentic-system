@@ -117,10 +117,30 @@ def agent_tool_registry(
             },
         )
     for name, handler in (extra_handlers or {}).items():
-        from app.sandbox.tools import register_sandbox_tools
-
         temp = ToolRegistry()
-        register_sandbox_tools(temp, {name: handler})
+        integration_names = {
+            "integration_list",
+            "github_create_repo",
+            "github_repo_info",
+            "github_branch_head",
+            "github_create_branch",
+            "github_commit_file",
+            "github_create_pr",
+            "github_push_default",
+            "vercel_create_project",
+            "vercel_deploy",
+            "vercel_deployment_status",
+            "vercel_deployment_url",
+            "http_check",
+        }
+        if name in integration_names:
+            from app.integrations.tools import register_deployer_tools
+
+            register_deployer_tools(temp, {name: handler})
+        else:
+            from app.sandbox.tools import register_sandbox_tools
+
+            register_sandbox_tools(temp, {name: handler})
         definition = temp.get(name)
         registry.register(
             name,

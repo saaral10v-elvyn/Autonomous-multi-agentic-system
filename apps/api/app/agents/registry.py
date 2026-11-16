@@ -91,7 +91,31 @@ for _role, _purpose, _tier, _allowlist in (
         ModelTier.STRONG,
         ("read_file", "git_diff", "review_complete", "finish"),
     ),
-    ("deployer", "Prepare deployment readiness.", ModelTier.BALANCED, ("finish",)),
+    (
+        "deployer",
+        "Publish the tested application using the user's connected GitHub and Vercel integrations. "
+        "List integrations first. Never expose credentials. "
+        "Request approval for irreversible actions.",
+        ModelTier.BALANCED,
+        (
+            "read_file",
+            "list_dir",
+            "integration_list",
+            "github_create_repo",
+            "github_repo_info",
+            "github_branch_head",
+            "github_create_branch",
+            "github_commit_file",
+            "github_create_pr",
+            "github_push_default",
+            "vercel_create_project",
+            "vercel_deploy",
+            "vercel_deployment_status",
+            "vercel_deployment_url",
+            "http_check",
+            "finish",
+        ),
+    ),
     ("reporter", "Summarize completed work.", ModelTier.FAST, ("finish",)),
 ):
     ROLE_TEMPLATES[_role] = RoleTemplate(
@@ -100,6 +124,6 @@ for _role, _purpose, _tier, _allowlist in (
         model_tier=_tier,
         tool_allowlist=_allowlist,
         output_schema="TaskResult",
-        max_steps=5,
+        max_steps=20 if _role == "deployer" else 5,
         max_cost_usd=0.5,
     )

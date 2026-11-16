@@ -20,6 +20,7 @@ from app.core.config import get_settings
 from app.core.db import SessionFactory
 from app.events.bus import EventBus
 from app.gate.engine import GateDecision, RiskClass, WorkflowGate, decide
+from app.integrations.registry import run_tool_handlers
 from app.llm.client import LLMClient
 from app.llm.errors import LLMRequestError, ProviderKeyUnavailable
 from app.llm.types import ModelTier, Provider
@@ -39,7 +40,6 @@ from app.repos.runs import RunRepository
 from app.repos.tasks import TaskRepository
 from app.repos.tool_executions import ToolExecutionRepository
 from app.sandbox.lifecycle import destroy_run_sandbox
-from app.sandbox.registry import sandbox_handlers
 from app.services.spawning import AgentSpawner
 from app.services.tools import ToolExecutionPipeline, ToolExecutionResult
 
@@ -354,7 +354,7 @@ class RunOrchestrator:
         spawner = AgentSpawner(SessionFactory, self._llm, provider, provider_key_id, self._bus)
         registry = agent_tool_registry(
             spawn_handler=spawner.handler(user_id, run_id, agent_id),
-            extra_handlers=await sandbox_handlers(user_id, run_id, agent_id, self._bus),
+            extra_handlers=await run_tool_handlers(user_id, run_id, agent_id, self._bus),
         )
         try:
             result = await self._runtime.run_task(
@@ -833,7 +833,7 @@ async def resume_approval_job(
         approval = await ApprovalRepository(session).get_for_user(user_id, approval_id)
         if approval is None or approval.run_id != run_id or approval.agent_id is None:
             raise LookupError("Approval not found.")
-        extra = await sandbox_handlers(user_id, run_id, approval.agent_id, bus)
+        extra = await run_tool_handlers(user_id, run_id, approval.agent_id, bus)
     result = await ToolExecutionPipeline(
         SessionFactory, agent_tool_registry(extra_handlers=extra), bus
     ).resume_approval(user_id, run_id, approval_id)
@@ -953,7 +953,7 @@ async def _replan_after_rejection(
         messages,
         llm_client,
         tool_registry=agent_tool_registry(
-            extra_handlers=await sandbox_handlers(user_id, run_id, execution.agent_id, event_bus)
+            extra_handlers=await run_tool_handlers(user_id, run_id, execution.agent_id, event_bus)
         ),
         force_new=True,
     )

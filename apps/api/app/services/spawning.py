@@ -12,6 +12,7 @@ from app.agents.runtime import AgentRuntime
 from app.agents.schemas import AdHocRole
 from app.agents.tools import ToolHandler
 from app.events.bus import EventBus
+from app.integrations.registry import run_tool_handlers
 from app.llm.client import LLMClient
 from app.llm.types import ModelTier, Provider
 from app.models.agent import Agent
@@ -19,7 +20,6 @@ from app.models.event import Event
 from app.models.task import Task
 from app.repos.agents import AgentRepository
 from app.repos.runs import RunRepository
-from app.sandbox.registry import sandbox_handlers
 
 MAX_AGENT_DEPTH = 3
 MAX_CONCURRENT_AGENTS = 4
@@ -202,7 +202,7 @@ class AgentSpawner:
             await self._bus.publish(event)
         registry = agent_tool_registry(
             spawn_handler=self.handler(user_id, run_id, agent.id),
-            extra_handlers=await sandbox_handlers(user_id, run_id, agent.id, self._bus),
+            extra_handlers=await run_tool_handlers(user_id, run_id, agent.id, self._bus),
         )
         child_prompt = f"Task: {task_text.strip()}\nContext references: {raw_refs}"
         result = await self._runtime.run_task(
