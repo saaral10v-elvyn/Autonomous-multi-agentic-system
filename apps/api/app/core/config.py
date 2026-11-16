@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.sandbox.egress import normalize_allowlist
+
 
 class Settings(BaseSettings):
     """Runtime settings loaded from environment and an optional .env file."""
@@ -27,12 +29,40 @@ class Settings(BaseSettings):
     llm_max_retries: int = 3
     llm_retry_base_seconds: float = 0.25
     approval_ttl_seconds: int = 86_400
+    sandbox_provider: Literal["docker", "fake"] = "docker"
+    sandbox_image: str = "forge-sandbox:latest"
+    sandbox_cpu: float = 1.0
+    sandbox_memory_mb: int = 1024
+    sandbox_pids_limit: int = 256
+    sandbox_disk_mb: int = 2048
+    sandbox_ttl_seconds: int = 3600
+    sandbox_network_mode: Literal["none", "allowlisted"] = "none"
+    sandbox_allowlist_hosts: tuple[str, ...] = (
+        "registry.npmjs.org",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "raw.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    )
+    sandbox_max_output_bytes: int = 65536
 
     @model_validator(mode="after")
     def prevent_fake_provider_in_production(self) -> "Settings":
         """Keep the deterministic demo provider unavailable in production settings."""
         if self.app_env == "production" and self.fake_provider_enabled:
             raise ValueError("FAKE_PROVIDER_ENABLED cannot be enabled in production.")
+        if self.app_env == "production" and self.sandbox_provider == "fake":
+            raise ValueError("SANDBOX_PROVIDER=fake cannot be used in production.")
+        if self.sandbox_network_mode == "allowlisted" and self.sandbox_provider != "docker":
+            raise ValueError("SANDBOX_NETWORK_MODE=allowlisted requires SANDBOX_PROVIDER=docker.")
+        if self.sandbox_allowlist_hosts:
+            normalize_allowlist(self.sandbox_allowlist_hosts)
+        elif self.sandbox_network_mode == "allowlisted":
+            raise ValueError("SANDBOX_ALLOWLIST_HOSTS must include at least one hostname.")
         return self
 
 
