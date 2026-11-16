@@ -17,7 +17,26 @@ def test_m5_role_templates_use_registered_safe_tools() -> None:
         assert template.max_steps > 0
         assert template.max_cost_usd > 0
         assert set(template.tool_allowlist).issubset(
-            {"demo_read", "demo_sandbox_write", "spawn_agent", "finish"}
+            {
+                "demo_read",
+                "demo_sandbox_write",
+                "spawn_agent",
+                "finish",
+                "sandbox_exec",
+                "read_file",
+                "write_file",
+                "list_dir",
+                "tester_report",
+                "git_init",
+                "git_status",
+                "git_diff",
+                "git_add",
+                "git_commit",
+                "git_branch",
+                "git_checkout",
+                "request_review",
+                "review_complete",
+            }
         )
 
 

@@ -35,6 +35,8 @@ describe("run clarification and plan interface", () => {
     vi.spyOn(api, "runApprovals").mockResolvedValue([]);
     vi.spyOn(api, "runAgents").mockResolvedValue([]);
     vi.spyOn(api, "runTasks").mockResolvedValue([]);
+    vi.spyOn(api, "runFiles").mockResolvedValue({ files: [] });
+    vi.spyOn(api, "runDiff").mockResolvedValue({ diff: "" });
   });
 
   afterEach(() => {

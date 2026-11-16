@@ -32,6 +32,7 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://forge:forge@localhost:5432/forge
       MASTER_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
       WEB_ORIGIN: http://localhost:3000
+      SANDBOX_IMAGE: forge-sandbox:latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -40,10 +41,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: apps/api/pyproject.toml
       - run: uv sync --directory apps/api --all-groups
+      - run: docker build -t forge-sandbox:latest -f infra/sandbox/Dockerfile .
       - run: uv run --directory apps/api ruff check .
       - run: uv run --directory apps/api mypy app
       - run: uv run --directory apps/api alembic upgrade head
-      - run: uv run --directory apps/api pytest
+      - run: uv run --directory apps/api pytest -m "not docker"
+      - run: uv run --directory apps/api pytest -m docker
   web:
     runs-on: ubuntu-latest
     steps:

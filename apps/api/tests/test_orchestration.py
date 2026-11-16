@@ -29,6 +29,7 @@ from app.repos.events import EventRepository
 from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
 from app.repos.tasks import TaskRepository
+from app.sandbox.registry import sandbox_handlers
 from app.services.orchestration import (
     PlanService,
     QuestionService,
@@ -310,7 +311,10 @@ def test_fake_provider_scheduler_runs_parallel_roots_before_dependent(
             del payload, call_key
             return {}
 
-        registry = agent_tool_registry(spawn_handler=no_spawn)
+        registry = agent_tool_registry(
+            spawn_handler=no_spawn,
+            extra_handlers=await sandbox_handlers(user_id, run_id, agent_id, EventBus()),
+        )
         key_id = uuid5(NAMESPACE_URL, f"forge-fake:{user_id}")
         await AgentRuntime(SessionFactory).complete(
             user_id,
@@ -342,7 +346,7 @@ def test_fake_provider_scheduler_runs_parallel_roots_before_dependent(
     llm = LLMClient(DevelopmentFakeKeyResolver(), providers={Provider.OPENAI: fake}, max_retries=0)
     orchestrator = RunOrchestrator(llm)
     assert api_client.portal.call(orchestrator.advance_until_input, user_id, run_id) == (
-        "EXECUTING"
+        "COMPLETED"
     )
 
     async def read_statuses() -> list[tuple[str, str]]:

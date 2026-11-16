@@ -38,6 +38,7 @@ select = ["E", "F", "I", "UP", "B"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["docker: requires Docker CLI, daemon, and built sandbox image"]
 
 [tool.mypy]
 python_version = "3.12"
