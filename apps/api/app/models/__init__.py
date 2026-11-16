@@ -6,6 +6,7 @@ from app.models.approval import Approval
 from app.models.artifact import Artifact
 from app.models.base import Base
 from app.models.event import Event
+from app.models.integration import Integration
 from app.models.message import Message
 from app.models.project import Project
 from app.models.provider_key import ProviderKey
@@ -22,6 +23,7 @@ __all__ = [
     "Artifact",
     "Base",
     "Event",
+    "Integration",
     "Message",
     "Project",
     "ProviderKey",

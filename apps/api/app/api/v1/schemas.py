@@ -240,3 +240,37 @@ class ProviderKeyTestResponse(BaseModel):
     tokens_in: int
     tokens_out: int
     cost_usd: Decimal
+
+
+class IntegrationKind(StrEnum):
+    """External services implemented in M7."""
+
+    GITHUB = "github"
+    VERCEL = "vercel"
+
+
+class IntegrationCreateRequest(BaseModel):
+    """Connect a GitHub or Vercel token without returning its value."""
+
+    account_label: Annotated[str, Field(min_length=1, max_length=100)]
+    token: Annotated[SecretStr, Field(min_length=8, max_length=8192)]
+
+    @field_validator("account_label")
+    @classmethod
+    def normalize_account_label(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Account label is required.")
+        return normalized
+
+
+class IntegrationResponse(BaseModel):
+    """Safe connection metadata; credential is never serialized."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    kind: IntegrationKind
+    account_label: str
+    last4: str
+    created_at: datetime
