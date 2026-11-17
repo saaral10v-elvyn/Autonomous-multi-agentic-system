@@ -40,7 +40,7 @@ from app.services.orchestration import (
 )
 from app.services.reports import get_final_report
 from app.services.run_controls import RunControlService
-from app.services.runs import RunService
+from app.services.runs import ConcurrentRunLimitExceeded, RunService
 
 router = APIRouter(prefix="/runs")
 
@@ -117,6 +117,8 @@ async def create_run(
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Project not found.") from None
+    except ConcurrentRunLimitExceeded as error:
+        raise HTTPException(status_code=429, detail=str(error)) from None
     await enqueue_advance(user.id, run.id)
     return RunResponse.model_validate(run)
 

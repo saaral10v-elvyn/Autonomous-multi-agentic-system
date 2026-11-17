@@ -1,6 +1,6 @@
 # Forge
 
-Forge is a SaaS where AI agents take a user's idea to a live deployed web app with configurable human-in-the-loop. This repository currently implements M1 through the M3 Clarifier/Planner workflow: account access, encrypted provider credentials, run events, clarification questions, and plan review.
+Forge is a SaaS where AI agents take a user's idea to a live deployed web app with configurable human-in-the-loop. M0–M8 deliver the idea-to-live-app flow, and M9 launch hardening is in progress. See [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) for scope and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for production setup.
 
 ## Prerequisites
 

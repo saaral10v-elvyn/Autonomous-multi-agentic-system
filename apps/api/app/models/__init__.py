@@ -5,6 +5,7 @@ from app.models.agent_step import AgentStep
 from app.models.approval import Approval
 from app.models.artifact import Artifact
 from app.models.base import Base
+from app.models.credit_ledger import CreditLedger
 from app.models.event import Event
 from app.models.integration import Integration
 from app.models.message import Message
@@ -12,6 +13,7 @@ from app.models.project import Project
 from app.models.provider_key import ProviderKey
 from app.models.question import Question
 from app.models.run import Run
+from app.models.subscription import Subscription
 from app.models.task import Task
 from app.models.tool_execution import ToolExecution
 from app.models.user import User
@@ -22,6 +24,7 @@ __all__ = [
     "Approval",
     "Artifact",
     "Base",
+    "CreditLedger",
     "Event",
     "Integration",
     "Message",
@@ -30,6 +33,7 @@ __all__ = [
     "Question",
     "Run",
     "Task",
+    "Subscription",
     "ToolExecution",
     "User",
 ]

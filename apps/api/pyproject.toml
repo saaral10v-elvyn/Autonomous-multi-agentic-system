@@ -11,6 +11,10 @@ dependencies = [
   "cryptography>=43,<52",
   "fastapi>=0.115,<1",
   "litellm>=1.108.2,<2",
+  # Required for the M9 tracing and metrics SDK with optional OTLP export.
+  "opentelemetry-api>=1.27,<2",
+  "opentelemetry-sdk>=1.27,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
   "pydantic-settings>=2.6,<3",
   "sqlalchemy[asyncio]>=2.0,<3",
   "structlog>=24.4,<26",
@@ -30,6 +34,10 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.uv]
+# Force the patched transitive filelock release identified by the M9 dependency audit.
+override-dependencies = ["filelock>=4.2.1"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

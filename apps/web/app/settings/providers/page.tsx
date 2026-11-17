@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { api, Provider, ProviderKey } from "@/lib/api";
 
 export default function ProvidersPage() {
@@ -45,9 +46,9 @@ export default function ProvidersPage() {
   }
 
   return <main className="mx-auto min-h-screen max-w-3xl px-6 py-12">
-    <header className="flex items-center justify-between"><a className="text-xl font-bold" href="/">Forge<span className="text-emerald-400">.</span></a><button className="text-sm text-slate-300" onClick={() => void api.logout().then(() => window.location.assign("/login"))}>Log out</button></header>
+    <header className="flex items-center justify-between"><Link className="text-xl font-bold" href="/">Forge<span className="text-emerald-400">.</span></Link><button className="text-sm text-slate-300" onClick={() => void api.logout().then(() => window.location.assign("/login"))}>Log out</button></header>
     <h1 className="mt-12 text-3xl font-semibold">Provider keys</h1>
-    <p className="mt-2 text-sm"><a className="underline" href="/settings/integrations">Manage GitHub and Vercel integrations</a></p>
+    <p className="mt-2 text-sm"><Link className="underline" href="/settings/integrations">Manage GitHub and Vercel integrations</Link></p>
     <p className="mt-2 text-slate-400">Connect your own model provider. Stored keys are write-only and never shown again.</p>
     <form onSubmit={addKey} className="mt-8 grid gap-4 rounded-xl border border-slate-800 bg-slate-900/60 p-6 sm:grid-cols-2">
       <label className="grid gap-2 text-sm">Provider<select name="provider" className="rounded-md border border-slate-700 bg-slate-950 px-3 py-2"><option value="anthropic">Anthropic</option><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option></select></label>

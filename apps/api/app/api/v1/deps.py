@@ -1,13 +1,16 @@
 """Request-scoped authentication and gateway dependencies."""
 
+import time
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.db import SessionFactory, get_db_session
 from app.core.security import SESSION_COOKIE, verify_session_token
+from app.events.redis import get_redis
 from app.llm.client import LLMClient
 from app.llm.fake import DemoWorkflowFakeProvider, DevelopmentFakeKeyResolver
 from app.llm.key_resolver import RepositoryProviderKeyResolver
@@ -31,6 +34,20 @@ async def get_current_user(request: Request, session: DbSession) -> User:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required."
         )
+    settings = get_settings()
+    bucket = int(time.time()) // settings.api_rate_limit_window_seconds
+    key = f"forge:rate:{user_id}:{bucket}"
+    try:
+        redis = get_redis()
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, settings.api_rate_limit_window_seconds + 1)
+    except RedisError:
+        raise HTTPException(
+            status_code=503, detail="Rate limiting is temporarily unavailable."
+        ) from None
+    if count > settings.api_rate_limit_requests:
+        raise HTTPException(status_code=429, detail="Request rate limit exceeded.")
     return user
 
 

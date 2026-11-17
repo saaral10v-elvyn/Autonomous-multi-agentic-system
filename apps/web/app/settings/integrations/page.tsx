@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { api, type Integration, type IntegrationKind } from "@/lib/api";
 
 export default function IntegrationsPage() {
@@ -29,7 +30,7 @@ export default function IntegrationsPage() {
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not remove integration."); }
   }
   return <main className="mx-auto min-h-screen max-w-3xl px-6 py-12">
-    <a className="text-xl font-bold" href="/">Forge.</a>
+    <Link className="text-xl font-bold" href="/">Forge.</Link>
     <h1 className="mt-12 text-3xl font-semibold">Integrations</h1>
     <p className="mt-2 text-slate-400">Connect GitHub and Vercel tokens. Tokens are write-only and decrypted only by their service adapters.</p>
     <form onSubmit={connect} className="mt-8 grid gap-4 rounded-xl border p-6 sm:grid-cols-2">

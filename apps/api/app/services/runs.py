@@ -3,13 +3,19 @@
 from decimal import Decimal
 from uuid import UUID
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.events.bus import EventBus
 from app.models.run import Run
 from app.repos.projects import ProjectRepository
 from app.repos.runs import RunRepository
 from app.repos.tasks import TaskRepository
+
+
+class ConcurrentRunLimitExceeded(Exception):
+    """Raised when creating another active run would exceed a user's configured cap."""
 
 
 def _project_name(idea: str) -> str:
@@ -38,6 +44,16 @@ class RunService:
         budget_usd: Decimal,
         project_id: UUID | None = None,
     ) -> Run:
+        # Serialize creation for this user so simultaneous requests cannot exceed the cap.
+        await self._session.execute(select(func.pg_advisory_xact_lock(func.hashtext(str(user_id)))))
+        active_count = await self._session.scalar(
+            select(func.count(Run.id)).where(
+                Run.user_id == user_id,
+                Run.status.notin_(("COMPLETED", "FAILED", "CANCELLED")),
+            )
+        )
+        if (active_count or 0) >= get_settings().max_concurrent_runs_per_user:
+            raise ConcurrentRunLimitExceeded("Concurrent run limit reached.")
         final_idea = idea.strip()
         run: Run | None
         if project_id is None:

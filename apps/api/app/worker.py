@@ -1,5 +1,7 @@
-"""Arq worker scaffold with a no-op job."""
+"""Arq worker with telemetry and sandbox cleanup jobs."""
 
+from collections.abc import Awaitable, Callable
+from time import perf_counter
 from typing import Any
 from uuid import UUID
 
@@ -9,6 +11,12 @@ from arq.connections import RedisSettings
 from app.api.v1.deps import get_llm_client
 from app.core.config import get_settings
 from app.core.db import SessionFactory
+from app.core.telemetry import (
+    shutdown_telemetry,
+    tracer,
+    worker_job_count,
+    worker_job_duration,
+)
 from app.repos.runs import RunRepository
 from app.sandbox.factory import get_sandbox_provider
 from app.services.approvals import expire_pending_approvals
@@ -22,15 +30,38 @@ async def noop_job(_: Any, message: str = "") -> str:
 
 async def advance_run(_: Any, user_id: str, run_id: str) -> str:
     """Advance one user-owned run until it needs an answer or approval."""
-    return await advance_run_job(UUID(user_id), UUID(run_id), get_llm_client())
+    return await _observe_job(
+        "advance_run",
+        run_id,
+        lambda: advance_run_job(UUID(user_id), UUID(run_id), get_llm_client()),
+    )
 
 
 async def resume_approval(_: Any, user_id: str, run_id: str, approval_id: str) -> str:
     """Resume the durable tool action linked to a resolved approval."""
-    result = await resume_approval_job(
-        UUID(user_id), UUID(run_id), UUID(approval_id), get_llm_client()
-    )
-    return result.status
+
+    async def resume() -> str:
+        result = await resume_approval_job(
+            UUID(user_id), UUID(run_id), UUID(approval_id), get_llm_client()
+        )
+        return result.status
+
+    return await _observe_job("resume_approval", run_id, resume)
+
+
+async def _observe_job(name: str, run_id: str, job: Callable[[], Awaitable[str]]) -> str:
+    started = perf_counter()
+    status = "error"
+    try:
+        with tracer.start_as_current_span(f"worker.{name}") as span:
+            span.set_attribute("forge.run_id", run_id)
+            result = await job()
+            status = "ok"
+            return result
+    finally:
+        attrs = {"job": name, "status": status}
+        worker_job_count.add(1, attrs)
+        worker_job_duration.record((perf_counter() - started) * 1000, attrs)
 
 
 async def expire_approvals(ctx: dict[Any, Any], *args: Any, **kwargs: Any) -> int:
@@ -59,6 +90,12 @@ async def cleanup_sandboxes(ctx: dict[Any, Any], *args: Any, **kwargs: Any) -> i
     return cleaned
 
 
+async def shutdown_worker(ctx: Any) -> None:
+    """Flush telemetry after the Arq process stops accepting work."""
+    del ctx
+    shutdown_telemetry()
+
+
 class WorkerSettings:
     """Arq worker configuration."""
 
@@ -67,4 +104,5 @@ class WorkerSettings:
         cron(expire_approvals, minute=set(range(60))),
         cron(cleanup_sandboxes, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
     ]
+    on_shutdown = shutdown_worker
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

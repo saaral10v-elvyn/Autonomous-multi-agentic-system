@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.sandbox.egress import normalize_allowlist
@@ -49,6 +49,12 @@ class Settings(BaseSettings):
         "release-assets.githubusercontent.com",
     )
     sandbox_max_output_bytes: int = 65536
+    api_rate_limit_requests: int = Field(default=120, gt=0, le=100_000)
+    api_rate_limit_window_seconds: int = Field(default=60, gt=0, le=86_400)
+    max_concurrent_runs_per_user: int = Field(default=2, gt=0, le=100)
+    platform_paid_enabled: bool = False
+    otel_service_name: str = "forge-api"
+    otel_exporter_otlp_endpoint: str | None = None
 
     @model_validator(mode="after")
     def prevent_fake_provider_in_production(self) -> "Settings":
