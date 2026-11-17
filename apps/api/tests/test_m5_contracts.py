@@ -36,6 +36,19 @@ def test_m5_role_templates_use_registered_safe_tools() -> None:
                 "git_checkout",
                 "request_review",
                 "review_complete",
+                "integration_list",
+                "github_create_repo",
+                "github_repo_info",
+                "github_branch_head",
+                "github_create_branch",
+                "github_commit_file",
+                "github_create_pr",
+                "github_push_default",
+                "vercel_create_project",
+                "vercel_deploy",
+                "vercel_deployment_status",
+                "vercel_deployment_url",
+                "http_check",
             }
         )
 
