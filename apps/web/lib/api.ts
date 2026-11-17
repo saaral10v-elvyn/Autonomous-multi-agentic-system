@@ -49,6 +49,7 @@ export type Run = {
   status: string;
   created_at: string;
 };
+export type RunReport = { id: string; run_id: string; markdown: string; created_at: string };
 export type RunEvent = {
   id: string;
   run_id: string;
@@ -142,11 +143,13 @@ export const api = {
   integrations: () => request<Integration[]>("/integrations"),
   connectIntegration: (kind: IntegrationKind, account_label: string, token: string) => request<Integration>(`/integrations/${kind}/connect`, { method: "POST", body: JSON.stringify({ account_label, token }) }),
   removeIntegration: (id: string) => request<void>(`/integrations/${id}`, { method: "DELETE" }),
-  createRun: (idea: string, autonomy_level: AutonomyLevel, budget_usd: number) => request<Run>("/runs", { method: "POST", body: JSON.stringify({ idea, autonomy_level, budget_usd }) }),
+  createRun: (idea: string, autonomy_level: AutonomyLevel, budget_usd: number, project_id?: string) => request<Run>("/runs", { method: "POST", body: JSON.stringify({ idea, autonomy_level, budget_usd, project_id }) }),
   runs: () => request<Run[]>("/runs"),
   run: (id: string) => request<Run>(`/runs/${id}`),
   runAgents: (id: string) => request<Agent[]>(`/runs/${id}/agents`),
   runTasks: (id: string) => request<RunTask[]>(`/runs/${id}/tasks`),
+  runReport: (id: string) => request<RunReport>(`/runs/${id}/report`),
+  retryTask: (id: string, taskId: string) => request<Run>(`/runs/${id}/tasks/${taskId}/retry`, { method: "POST" }),
   runFiles: (id: string) => request<SandboxFileTree>(`/runs/${id}/files`),
   runFileContent: (id: string, path: string) => request<SandboxFileContent>(`/runs/${id}/files/content?path=${encodeURIComponent(path)}`),
   runDiff: (id: string) => request<SandboxDiff>(`/runs/${id}/diff`),

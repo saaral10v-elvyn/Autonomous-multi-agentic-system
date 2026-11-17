@@ -53,7 +53,7 @@ async def cleanup_sandboxes(ctx: dict[Any, Any], *args: Any, **kwargs: Any) -> i
         if owner is not None:
             async with SessionFactory() as session:
                 run = await RunRepository(session).get_for_user(owner, run_id)
-        if run is None or run.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+        if run is None or run.status in {"COMPLETED", "CANCELLED"}:
             await provider.destroy(handle)
             cleaned += 1
     return cleaned

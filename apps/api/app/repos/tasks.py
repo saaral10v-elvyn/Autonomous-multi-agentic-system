@@ -140,3 +140,63 @@ class TaskRepository:
             .join(Run, Run.id == Task.run_id)
             .where(Run.user_id == user_id, Run.id == run_id, Task.id == task_id)
         )
+
+    async def retry_from(self, user_id: UUID, run_id: UUID, task_id: UUID) -> list[Task] | None:
+        """Reset the chosen task and every dependent task for a fresh attempt."""
+        tasks = await self.list_for_run(user_id, run_id)
+        if tasks is None:
+            return None
+        by_id = {task.id: task for task in tasks}
+        if task_id not in by_id:
+            return None
+        affected = {
+            task_id,
+            *(task.id for task in tasks if task.status in {"failed", "blocked", "interrupted"}),
+        }
+        changed = True
+        while changed:
+            changed = False
+            for task in tasks:
+                if task.id not in affected and any(
+                    dependency in affected for dependency in task.depends_on
+                ):
+                    affected.add(task.id)
+                    changed = True
+        for current_id in affected:
+            task = by_id[current_id]
+            task.status = "pending"
+            task.output = None
+        await self._session.flush()
+        return [by_id[current_id] for current_id in affected]
+
+    async def ensure_workflow_task(
+        self,
+        user_id: UUID,
+        run_id: UUID,
+        role: str,
+        description: str,
+        depends_on: list[UUID] | None = None,
+    ) -> tuple[Task | None, bool]:
+        """Create a durable post-build Deployer or Reporter task once per run."""
+        external_id = f"__m8_{role}__"
+        run_exists = await self._session.scalar(
+            select(Run.id).where(Run.id == run_id, Run.user_id == user_id).with_for_update()
+        )
+        if run_exists is None:
+            return None, False
+        task = await self._session.scalar(
+            select(Task).where(Task.run_id == run_id, Task.external_id == external_id)
+        )
+        if task is not None:
+            return task, False
+        task = Task(
+            run_id=run_id,
+            external_id=external_id,
+            title=f"{role.title()} project delivery",
+            description=description,
+            depends_on=depends_on or [],
+            input={"system_role": role},
+        )
+        self._session.add(task)
+        await self._session.flush()
+        return task, True

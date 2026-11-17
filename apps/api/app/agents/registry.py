@@ -116,7 +116,15 @@ for _role, _purpose, _tier, _allowlist in (
             "finish",
         ),
     ),
-    ("reporter", "Summarize completed work.", ModelTier.FAST, ("finish",)),
+    (
+        "reporter",
+        "Write a concise Markdown summary of the finished project. Cover the idea, what was built, "
+        "plan versus actual, test results, repository and live URLs, approvals, cost, "
+        "known issues, "
+        "and next steps in the TaskResult summary.",
+        ModelTier.FAST,
+        ("finish",),
+    ),
 ):
     ROLE_TEMPLATES[_role] = RoleTemplate(
         name=_role,

@@ -97,10 +97,11 @@ class ApprovalService:
             self._session,
             user_id,
             run,
-            "EXECUTING",
+            run.paused_from_status or "EXECUTING",
             event_bus=self._bus,
             payload={"approval_id": str(approval.id), "decision": decision},
         )
+        run.paused_from_status = None
         await self._session.commit()
         events = await _refresh_events(self._session, [resolved_event, state_event])
         await _publish_all(self._bus, events)
@@ -117,6 +118,9 @@ class ApprovalService:
             "PLANNING",
             "AWAITING_PLAN_APPROVAL",
             "EXECUTING",
+            "VERIFYING",
+            "DEPLOYING",
+            "REPORTING",
             "AWAITING_APPROVAL",
         }:
             raise ApprovalConflict("Autonomy can be changed only while a run is active.")
@@ -185,16 +189,18 @@ async def expire_pending_approvals(limit: int = 100) -> int:
             events = [resolved]
             should_resume = run.status == "AWAITING_APPROVAL"
             if should_resume:
+                resume_status = run.paused_from_status or "EXECUTING"
                 events.append(
                     await stage_transition(
                         session,
                         user_id,
                         run,
-                        "EXECUTING",
+                        resume_status,
                         event_bus=bus,
                         payload={"approval_expired": str(approval.id)},
                     )
                 )
+                run.paused_from_status = None
             await session.commit()
             committed = await _refresh_events(session, events)
         await _publish_all(bus, committed)

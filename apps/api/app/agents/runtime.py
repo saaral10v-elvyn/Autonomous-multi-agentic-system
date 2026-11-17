@@ -74,7 +74,7 @@ class AgentRuntime:
             run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
             if run is None:
                 raise LookupError("Run not found.")
-            allowed_states = {"EXECUTING"}
+            allowed_states = {"EXECUTING", "VERIFYING", "DEPLOYING", "REPORTING"}
             if template.name == "clarifier":
                 allowed_states.add("CLARIFYING")
             if template.name == "planner":
@@ -355,6 +355,14 @@ class AgentRuntime:
                     return TaskResult(
                         status="waiting_approval",
                         summary="Waiting for approval before continuing this task.",
+                    )
+                if result.status == "uncertain":
+                    return TaskResult(
+                        status="failed",
+                        summary=(
+                            "An irreversible action has an unknown external outcome and was "
+                            "not repeated."
+                        ),
                     )
                 if result.output is not None and result.output.get("child_task_id"):
                     child_id = result.output.get("child_task_id")

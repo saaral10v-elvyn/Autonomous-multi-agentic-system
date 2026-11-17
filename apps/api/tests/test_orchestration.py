@@ -1,6 +1,7 @@
 """Real-Postgres M3 orchestration tests using the deterministic FakeProvider."""
 
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -20,9 +21,12 @@ from app.llm.client import LLMClient
 from app.llm.fake import DevelopmentFakeKeyResolver, FakeProvider
 from app.llm.key_resolver import RepositoryProviderKeyResolver
 from app.llm.types import LLMResponse, Provider
+from app.models.agent import Agent
 from app.models.event import Event
+from app.models.project import Project
 from app.models.run import Run
 from app.models.task import Task
+from app.models.tool_execution import ToolExecution
 from app.orchestrator.state import transition_run
 from app.repos.agents import AgentRepository
 from app.repos.events import EventRepository
@@ -30,10 +34,12 @@ from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
 from app.repos.tasks import TaskRepository
 from app.sandbox.registry import sandbox_handlers
+from app.services import orchestration as orchestration_module
 from app.services.orchestration import (
     PlanService,
     QuestionService,
     RunOrchestrator,
+    _mark_completed,
     advance_run_job,
 )
 from app.services.runs import RunService
@@ -234,12 +240,125 @@ def test_task_scheduler_claims_ready_dependencies_and_blocks_failed_dependents(
     assert blocked_ids == ["second"]
 
 
+def test_report_persistence_failure_keeps_run_out_of_completed(
+    api_client: TestClient,
+    test_emails: Callable[[], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id, run_id = create_user_and_run(api_client, test_emails())
+
+    async def set_reporting() -> None:
+        async with SessionFactory() as session:
+            run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
+            assert run is not None
+            run.status = "REPORTING"
+            await session.commit()
+
+    async def no_report(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(orchestration_module, "create_final_report", no_report)
+    api_client.portal.call(set_reporting)
+    api_client.portal.call(_mark_completed, user_id, run_id)
+    response = api_client.get(f"/api/v1/runs/{run_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "FAILED"
+
+
+def test_deployer_requires_ready_deployment_and_matching_smoke_check(
+    api_client: TestClient, test_emails: Callable[[], str]
+) -> None:
+    user_id, run_id = create_user_and_run(api_client, test_emails())
+    agent_id = uuid5(NAMESPACE_URL, f"deployer:{run_id}")
+    live_url = "https://journal.example.vercel.app"
+
+    async def check_evidence() -> tuple[bool, bool, bool]:
+        async with SessionFactory() as session:
+            run = await RunRepository(session).get_for_user(user_id, run_id)
+            assert run is not None
+            project = await session.get(Project, run.project_id)
+            assert project is not None
+            project.repo_url = "https://github.com/example/journal"
+            project.live_url = live_url
+            agent = Agent(
+                id=agent_id,
+                run_id=run_id,
+                role="deployer",
+                config={},
+                status="running",
+            )
+            session.add(agent)
+            created = datetime.now(UTC)
+            rows = [
+                ToolExecution(
+                    run_id=run_id,
+                    agent_id=agent_id,
+                    idempotency_key=f"deploy-evidence-{index}",
+                    tool_name=tool_name,
+                    input_payload=input_payload,
+                    output_payload=output,
+                    status="completed",
+                    created_at=created,
+                    completed_at=created,
+                )
+                for index, (tool_name, input_payload, output) in enumerate(
+                    [
+                        ("vercel_deploy", {}, {"deployment_id": "deploy-1"}),
+                        (
+                            "vercel_deployment_status",
+                            {},
+                            {"readyState": "READY"},
+                        ),
+                        ("vercel_deployment_url", {}, {"url": live_url}),
+                        (
+                            "http_check",
+                            {"url": live_url},
+                            {"ok": True, "status_code": 200},
+                        ),
+                    ]
+                )
+            ]
+            session.add_all(rows)
+            await session.flush()
+            good = await orchestration_module._deployer_evidence(session, user_id, run_id, agent_id)
+            rows[1].output_payload = {"readyState": "BUILDING"}
+            not_ready = await orchestration_module._deployer_evidence(
+                session, user_id, run_id, agent_id
+            )
+            rows[1].output_payload = {"readyState": "READY"}
+            rows[3].input_payload = {"url": "https://other.example.vercel.app"}
+            wrong_smoke_target = await orchestration_module._deployer_evidence(
+                session, user_id, run_id, agent_id
+            )
+            await session.rollback()
+            return good, not_ready, wrong_smoke_target
+
+    assert api_client.portal.call(check_evidence) == (True, False, False)
+
+
 def test_fake_provider_scheduler_runs_parallel_roots_before_dependent(
     api_client: TestClient,
     test_emails: Callable[[], str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FAKE_PROVIDER_ENABLED", "true")
+
+    async def recorded_tester(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    async def recorded_reviewer(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    async def recorded_deployment(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    monkeypatch.setattr(orchestration_module, "_tester_report_passed", recorded_tester)
+    monkeypatch.setattr(orchestration_module, "_reviewer_passed", recorded_reviewer)
+    monkeypatch.setattr(orchestration_module, "_deployer_evidence", recorded_deployment)
     get_settings.cache_clear()
     user_id, run_id = create_user_and_run(api_client, test_emails())
     plan = PlanDocument.model_validate(
@@ -342,6 +461,15 @@ def test_fake_provider_scheduler_runs_parallel_roots_before_dependent(
         )
         for index in range(2)
     ]
+    scripted.extend(
+        LLMResponse(
+            provider=Provider.OPENAI,
+            model="fake-model",
+            content=TaskResult(status="completed", summary=f"{role} passed").model_dump_json(),
+            cost_usd=Decimal("0.01"),
+        )
+        for role in ("tester", "reviewer", "deployer", "reporter")
+    )
     fake = FakeProvider(scripted)
     llm = LLMClient(DevelopmentFakeKeyResolver(), providers={Provider.OPENAI: fake}, max_retries=0)
     orchestrator = RunOrchestrator(llm)
@@ -356,7 +484,16 @@ def test_fake_provider_scheduler_runs_parallel_roots_before_dependent(
             return [(task.external_id, task.status) for task in tasks]
 
     assert {status for _, status in api_client.portal.call(read_statuses)} == {"completed"}
-    assert len(fake.messages) == 2
+    assert len(fake.messages) == 6
+    phase_types = [
+        event.payload.get("phase")
+        for event in get_events(api_client, user_id, run_id)
+        if event.type == "run.phase_changed"
+    ]
+    assert phase_types == ["VERIFYING", "VERIFYING", "DEPLOYING", "REPORTING"]
+    report = api_client.get(f"/api/v1/runs/{run_id}/report")
+    assert report.status_code == 200
+    assert "repository" in report.json()["markdown"].lower()
 
     async def recovered_step_count() -> int:
         async with SessionFactory() as session:

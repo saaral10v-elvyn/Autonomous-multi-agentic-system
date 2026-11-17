@@ -14,7 +14,10 @@ const stream = vi.hoisted(() => ({
   }>,
 }));
 
-vi.mock("next/navigation", () => ({ useParams: () => ({ id: "run-1" }) }));
+vi.mock("next/navigation", () => ({
+  useParams: () => ({ id: "run-1" }),
+  useRouter: () => ({ push: vi.fn() }),
+}));
 vi.mock("@/hooks/use-run-stream", () => ({
   useRunStream: () => ({ events: stream.events as RunEvent[], connected: true }),
 }));

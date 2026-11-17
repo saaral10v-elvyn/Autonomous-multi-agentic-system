@@ -17,6 +17,9 @@ ACTIVE_STATES = {
     "PLANNING",
     "AWAITING_PLAN_APPROVAL",
     "EXECUTING",
+    "VERIFYING",
+    "DEPLOYING",
+    "REPORTING",
     "AWAITING_APPROVAL",
 }
 LEGAL_TRANSITIONS: dict[str, set[str]] = {
@@ -25,10 +28,13 @@ LEGAL_TRANSITIONS: dict[str, set[str]] = {
     "AWAITING_ANSWERS": {"PLANNING"},
     "PLANNING": {"AWAITING_PLAN_APPROVAL", "EXECUTING"},
     "AWAITING_PLAN_APPROVAL": {"EXECUTING"},
-    "EXECUTING": {"AWAITING_APPROVAL", "COMPLETED"},
-    "AWAITING_APPROVAL": {"EXECUTING"},
+    "EXECUTING": {"AWAITING_APPROVAL", "VERIFYING"},
+    "VERIFYING": {"AWAITING_APPROVAL", "DEPLOYING"},
+    "DEPLOYING": {"AWAITING_APPROVAL", "REPORTING"},
+    "REPORTING": {"AWAITING_APPROVAL", "COMPLETED"},
+    "AWAITING_APPROVAL": {"EXECUTING", "VERIFYING", "DEPLOYING", "REPORTING"},
     "PAUSED": set(),
-    "FAILED": set(),
+    "FAILED": {"EXECUTING", "VERIFYING", "DEPLOYING", "REPORTING"},
     "CANCELLED": set(),
 }
 
@@ -44,6 +50,13 @@ def validate_transition(current: str, target: str) -> None:
     if target == "PAUSED" and current in ACTIVE_STATES:
         return
     if current == "PAUSED" and target in ACTIVE_STATES:
+        return
+    if current == "AWAITING_APPROVAL" and target in {
+        "EXECUTING",
+        "VERIFYING",
+        "DEPLOYING",
+        "REPORTING",
+    }:
         return
     if target not in LEGAL_TRANSITIONS.get(current, set()):
         raise IllegalRunTransition(f"Cannot transition run from {current} to {target}.")
@@ -63,7 +76,8 @@ async def stage_transition(
     previous = run.status
     run.status = target
     if target == "PAUSED":
-        run.paused_from_status = previous
+        if previous != "AWAITING_APPROVAL" or run.paused_from_status is None:
+            run.paused_from_status = previous
     elif previous == "PAUSED":
         run.paused_from_status = None
     body: dict[str, object] = {"from": previous, "status": target}

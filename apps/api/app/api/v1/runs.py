@@ -13,6 +13,7 @@ from app.api.v1.schemas import (
     ApprovalResponse,
     AutonomyUpdateRequest,
     PlanUpdateRequest,
+    ReportResponse,
     RunCreateRequest,
     RunEventResponse,
     RunResponse,
@@ -20,7 +21,8 @@ from app.api.v1.schemas import (
     UserMessageRequest,
 )
 from app.core.config import get_settings
-from app.orchestrator.state import IllegalRunTransition
+from app.events.bus import EventBus
+from app.orchestrator.state import IllegalRunTransition, stage_transition
 from app.repos.agents import AgentRepository
 from app.repos.events import EventRepository
 from app.repos.runs import RunRepository
@@ -36,6 +38,7 @@ from app.services.orchestration import (
     WorkflowConflict,
     enqueue_advance,
 )
+from app.services.reports import get_final_report
 from app.services.run_controls import RunControlService
 from app.services.runs import RunService
 
@@ -104,13 +107,109 @@ async def run_diff(run_id: UUID, user: CurrentUser, session: DbSession) -> dict[
 async def create_run(
     payload: RunCreateRequest, user: CurrentUser, session: DbSession
 ) -> RunResponse:
-    run = await RunService(session).create(
-        user.id,
-        idea=payload.idea,
-        autonomy_level=payload.autonomy_level.value,
-        budget_usd=payload.budget_usd,
-    )
+    try:
+        run = await RunService(session).create(
+            user.id,
+            idea=payload.idea,
+            autonomy_level=payload.autonomy_level.value,
+            budget_usd=payload.budget_usd,
+            project_id=payload.project_id,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Project not found.") from None
     await enqueue_advance(user.id, run.id)
+    return RunResponse.model_validate(run)
+
+
+@router.get("/{run_id}/report", response_model=ReportResponse)
+async def get_run_report(run_id: UUID, user: CurrentUser, session: DbSession) -> ReportResponse:
+    report = await get_final_report(session, user.id, run_id)
+    if report is None:
+        if await RunRepository(session).get_for_user(user.id, run_id) is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        raise HTTPException(status_code=404, detail="Final report is not available yet.")
+    return ReportResponse(
+        id=report.id,
+        run_id=run_id,
+        markdown=str(report.meta.get("markdown", "")),
+        created_at=report.created_at,
+    )
+
+
+@router.post("/{run_id}/tasks/{task_id}/retry", response_model=RunResponse)
+async def retry_task(
+    run_id: UUID, task_id: UUID, user: CurrentUser, session: DbSession
+) -> RunResponse:
+    run = await RunRepository(session).get_for_user(user.id, run_id, lock=True)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if run.status != "FAILED":
+        raise HTTPException(status_code=409, detail="Run cannot retry a task in its current state.")
+    tasks = await TaskRepository(session).list_for_run(user.id, run_id)
+    task = next((item for item in tasks or [] if item.id == task_id), None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if task.status not in {"failed", "blocked", "interrupted"}:
+        raise HTTPException(
+            status_code=409, detail="Only failed, blocked, or interrupted tasks can be retried."
+        )
+    reset = await TaskRepository(session).retry_from(user.id, run_id, task_id)
+    if reset is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    bus = EventBus()
+    state_event = None
+    if run.status == "FAILED":
+        run.completed_at = None
+        reset_ids = {item.id for item in reset}
+        reset_roles = {
+            str(item.input.get("system_role"))
+            for item in tasks or []
+            if item.id in reset_ids and item.input.get("system_role")
+        }
+        reset_plan_task = any(
+            item.id in reset_ids and not item.input.get("system_role") for item in tasks or []
+        )
+        target = (
+            "EXECUTING"
+            if reset_plan_task
+            else next(
+                (
+                    state
+                    for role, state in (
+                        ("tester", "VERIFYING"),
+                        ("reviewer", "VERIFYING"),
+                        ("deployer", "DEPLOYING"),
+                        ("reporter", "REPORTING"),
+                    )
+                    if role in reset_roles
+                ),
+                "EXECUTING",
+            )
+        )
+        state_event = await stage_transition(
+            session,
+            user.id,
+            run,
+            target,
+            event_bus=bus,
+            payload={"retry_from_task_id": str(task_id)},
+        )
+    event = await bus.persist(
+        session,
+        user.id,
+        run_id,
+        event_type="task.retry_requested",
+        payload={"task_id": str(task_id), "reset_task_ids": [str(item.id) for item in reset]},
+    )
+    await session.commit()
+    if state_event is not None:
+        await session.refresh(state_event)
+        await bus.publish(state_event)
+    if event is not None:
+        await session.refresh(event)
+        await bus.publish(event)
+    await session.refresh(run)
+    await enqueue_advance(user.id, run_id)
     return RunResponse.model_validate(run)
 
 

@@ -1,6 +1,6 @@
 """Single gated, durable pipeline for registered agent tools."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from hashlib import sha256
@@ -14,6 +14,7 @@ from app.events.bus import EventBus
 from app.gate.engine import GateDecision, decide
 from app.models.agent import Agent
 from app.models.event import Event
+from app.models.run import Run
 from app.models.tool_execution import ToolExecution
 from app.orchestrator.state import IllegalRunTransition, stage_transition
 from app.repos.agents import AgentRepository
@@ -72,12 +73,16 @@ class ToolExecutionPipeline:
                 role = await session.scalar(
                     select(Agent.role).where(Agent.id == agent_id, Agent.run_id == run_id)
                 )
-                if role == "tester" and not await _tester_report_passed(session, run_id, agent_id):
+                if role == "tester" and not await _tester_report_passed(
+                    session, user_id, run_id, agent_id
+                ):
                     raise IllegalRunTransition(
                         "Tester cannot complete successfully without a passing report "
                         "for its latest executed command."
                     )
-            if definition.requires_reviewer_pass and not await _reviewer_passed(session, run_id):
+            if definition.requires_reviewer_pass and not await _reviewer_passed(
+                session, user_id, run_id
+            ):
                 request = await self._bus.persist(
                     session,
                     user_id,
@@ -104,7 +109,8 @@ class ToolExecutionPipeline:
                 and tool_name == "ask_user"
                 and definition.risk.value == "read"
             )
-            if run.status != "EXECUTING" and not clarification_tool:
+            execution_states = {"EXECUTING", "VERIFYING", "DEPLOYING", "REPORTING"}
+            if run.status not in execution_states and not clarification_tool:
                 raise IllegalRunTransition("Tools can run only while the run is executing.")
 
             execution_repo = ToolExecutionRepository(session)
@@ -125,6 +131,21 @@ class ToolExecutionPipeline:
                 if execution is None:
                     raise LookupError("Run not found.")
                 new_execution = True
+
+            if definition.risk.value == "irreversible":
+                prior = await session.scalars(
+                    select(ToolExecution)
+                    .where(
+                        ToolExecution.run_id == run_id,
+                        ToolExecution.tool_name == tool_name,
+                        ToolExecution.idempotency_key != call_key,
+                    )
+                    .order_by(ToolExecution.created_at, ToolExecution.id)
+                    .with_for_update()
+                )
+                replay = irreversible_action_replay(prior.all(), tool_name, request_payload)
+                if replay is not None:
+                    return replay
 
             if new_execution:
                 call_event = await self._bus.persist(
@@ -164,7 +185,8 @@ class ToolExecutionPipeline:
                 if approval is None:
                     raise LookupError("Run not found.")
                 suspended_approval_id = approval.id
-                if run.status == "EXECUTING":
+                if run.status in execution_states:
+                    run.paused_from_status = run.status
                     event = await stage_transition(
                         session,
                         user_id,
@@ -225,7 +247,14 @@ class ToolExecutionPipeline:
         if execution is None:
             raise LookupError("Tool execution was not found.")
         return await self._run_handler(
-            user_id, run_id, agent_id, execution, definition.handler, request_payload, call_key
+            user_id,
+            run_id,
+            agent_id,
+            execution,
+            definition.handler,
+            request_payload,
+            call_key,
+            irreversible=definition.risk.value == "irreversible",
         )
 
     async def resume_approval(
@@ -244,7 +273,7 @@ class ToolExecutionPipeline:
                 raise IllegalRunTransition("Approval is still pending.")
             if approval.status not in {"approved", "rejected", "edited", "expired"}:
                 raise IllegalRunTransition("Approval has no executable decision.")
-            if run.status != "EXECUTING":
+            if run.status not in {"EXECUTING", "VERIFYING", "DEPLOYING", "REPORTING"}:
                 raise IllegalRunTransition("Run is not ready to resume the approved action.")
             if approval.idempotency_key is None:
                 raise LookupError("Approval is not linked to a tool call.")
@@ -314,6 +343,7 @@ class ToolExecutionPipeline:
             definition.handler,
             actual_payload,
             execution.idempotency_key,
+            irreversible=definition.risk.value == "irreversible",
         )
 
     async def _run_handler(
@@ -325,8 +355,41 @@ class ToolExecutionPipeline:
         handler: ToolHandler,
         payload: Mapping[str, object],
         call_key: str,
+        *,
+        irreversible: bool,
     ) -> ToolExecutionResult:
         """Invoke a risk-classified handler, then atomically persist its result."""
+        if execution.status == "completed":
+            return ToolExecutionResult("completed", execution.output_payload)
+        if (
+            irreversible
+            and execution.output_payload
+            and execution.output_payload.get("_started") is True
+        ):
+            return ToolExecutionResult(
+                "uncertain", {"status": "outcome_unknown", "tool_name": execution.tool_name}
+            )
+        async with self._sessions() as session:
+            current = await ToolExecutionRepository(session).get_for_key(
+                user_id, run_id, call_key, lock=True
+            )
+            if current is None:
+                raise LookupError("Tool execution was not found.")
+            if (
+                irreversible
+                and current.output_payload
+                and current.output_payload.get("_started") is True
+            ):
+                return ToolExecutionResult(
+                    "uncertain", {"status": "outcome_unknown", "tool_name": execution.tool_name}
+                )
+            if irreversible:
+                current.input_payload = {
+                    "_request_payload": _request_payload(current.input_payload),
+                    "_executed_payload": dict(payload),
+                }
+                current.output_payload = {"_started": True}
+                await session.commit()
         output_value = await handler(payload, call_key)
         output = dict(output_value)
         return await self._persist_result(
@@ -402,14 +465,57 @@ def _validate_replay(
     execution: ToolExecution, tool_name: str, payload: Mapping[str, object]
 ) -> None:
     """Reject accidental reuse of one call ID for a different action."""
-    if execution.tool_name != tool_name or execution.input_payload != dict(payload):
+    if execution.tool_name != tool_name or _request_payload(execution.input_payload) != dict(
+        payload
+    ):
         raise ValueError("Tool idempotency key was reused with different action data.")
 
 
-async def _reviewer_passed(session: AsyncSession, run_id: UUID) -> bool:
+def _request_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """Return the model's original call when an edited approval is recorded."""
+    request = payload.get("_request_payload")
+    return dict(request) if isinstance(request, dict) else dict(payload)
+
+
+def _executed_action_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """Return the exact approved target for semantic irreversible-action replay."""
+    executed = payload.get("_executed_payload")
+    return dict(executed) if isinstance(executed, dict) else _request_payload(payload)
+
+
+def irreversible_action_replay(
+    prior_executions: Sequence[ToolExecution],
+    tool_name: str,
+    payload: Mapping[str, object],
+) -> ToolExecutionResult | None:
+    """Reuse a successful external action or fail closed when its outcome is uncertain."""
+    for execution in prior_executions:
+        if execution.status == "completed":
+            output = execution.output_payload or {}
+            if output.get("status") in {"rejected", "expired"}:
+                continue
+            if _executed_action_payload(execution.input_payload) != dict(payload):
+                raise IllegalRunTransition(
+                    "This irreversible action already has a different recorded target."
+                )
+            return ToolExecutionResult("completed", execution.output_payload)
+        return ToolExecutionResult(
+            "uncertain", {"status": "outcome_unknown", "tool_name": tool_name}
+        )
+    return None
+
+
+async def _reviewer_passed(
+    session: AsyncSession,
+    user_id: UUID,
+    run_id: UUID,
+    expected_agent_id: UUID | None = None,
+) -> bool:
     result = await session.scalars(
         select(Event)
+        .join(Run, Run.id == Event.run_id)
         .where(
+            Run.user_id == user_id,
             Event.run_id == run_id,
             Event.type.in_(("review.requested", "review.completed")),
         )
@@ -426,9 +532,16 @@ async def _reviewer_passed(session: AsyncSession, run_id: UUID) -> bool:
         agent_id = UUID(raw_agent_id)
     except ValueError:
         return False
+    if expected_agent_id is not None and agent_id != expected_agent_id:
+        return False
     reviewer = await session.scalar(
-        select(Agent.id).where(
-            Agent.id == agent_id, Agent.run_id == run_id, Agent.role == "reviewer"
+        select(Agent.id)
+        .join(Run, Run.id == Agent.run_id)
+        .where(
+            Run.user_id == user_id,
+            Agent.id == agent_id,
+            Agent.run_id == run_id,
+            Agent.role == "reviewer",
         )
     )
     return _is_passing_reviewer(event.payload, "reviewer" if reviewer is not None else None)
@@ -439,10 +552,14 @@ def _is_passing_reviewer(payload: Mapping[str, object], role: str | None) -> boo
     return role == "reviewer" and payload.get("passed") is True
 
 
-async def _tester_report_passed(session: AsyncSession, run_id: UUID, agent_id: UUID) -> bool:
+async def _tester_report_passed(
+    session: AsyncSession, user_id: UUID, run_id: UUID, agent_id: UUID
+) -> bool:
     report = await session.scalar(
         select(ToolExecution)
+        .join(Run, Run.id == ToolExecution.run_id)
         .where(
+            Run.user_id == user_id,
             ToolExecution.run_id == run_id,
             ToolExecution.agent_id == agent_id,
             ToolExecution.tool_name == "tester_report",
@@ -455,7 +572,9 @@ async def _tester_report_passed(session: AsyncSession, run_id: UUID, agent_id: U
         return False
     latest_execution = await session.scalar(
         select(ToolExecution)
+        .join(Run, Run.id == ToolExecution.run_id)
         .where(
+            Run.user_id == user_id,
             ToolExecution.run_id == run_id,
             ToolExecution.agent_id == agent_id,
             ToolExecution.tool_name == "sandbox_exec",

@@ -5,11 +5,13 @@ import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
 from typing import Literal
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.demo_tools import agent_tool_registry
@@ -17,7 +19,7 @@ from app.agents.registry import ROLE_TEMPLATES, RoleTemplate
 from app.agents.runtime import AgentRuntime, BudgetExceededError
 from app.agents.schemas import PlanDocument, QuestionSet
 from app.core.config import get_settings
-from app.core.db import SessionFactory
+from app.core.db import SessionFactory, engine
 from app.events.bus import EventBus
 from app.gate.engine import GateDecision, RiskClass, WorkflowGate, decide
 from app.integrations.registry import run_tool_handlers
@@ -27,21 +29,30 @@ from app.llm.types import ModelTier, Provider
 from app.models.agent import Agent
 from app.models.event import Event
 from app.models.message import Message
+from app.models.project import Project
 from app.models.provider_key import ProviderKey
 from app.models.question import Question
 from app.models.run import Run
+from app.models.tool_execution import ToolExecution
 from app.orchestrator.state import IllegalRunTransition, stage_transition
 from app.repos.agents import AgentRepository
 from app.repos.approvals import ApprovalRepository
 from app.repos.plans import PlanRepository
+from app.repos.projects import ProjectRepository
 from app.repos.provider_keys import ProviderKeyRepository
 from app.repos.questions import QuestionRepository
 from app.repos.runs import RunRepository
 from app.repos.tasks import TaskRepository
 from app.repos.tool_executions import ToolExecutionRepository
 from app.sandbox.lifecycle import destroy_run_sandbox
+from app.services.reports import create_final_report
 from app.services.spawning import AgentSpawner
-from app.services.tools import ToolExecutionPipeline, ToolExecutionResult
+from app.services.tools import (
+    ToolExecutionPipeline,
+    ToolExecutionResult,
+    _reviewer_passed,
+    _tester_report_passed,
+)
 
 
 class WorkflowConflict(ValueError):
@@ -108,16 +119,31 @@ async def _mark_failed(user_id: UUID, run_id: UUID, message: str) -> None:
             await session.refresh(failure_event)
             events.append(failure_event)
     await _publish_all(bus, events)
-    await destroy_run_sandbox(run_id)
 
 
 async def _mark_completed(user_id: UUID, run_id: UUID) -> None:
     bus = EventBus()
     async with SessionFactory() as session:
         run = await RunRepository(session).get_for_user(user_id, run_id, lock=True)
-        if run is None or run.status != "EXECUTING":
+        if run is None or run.status != "REPORTING":
             return
         run.completed_at = datetime.now(UTC)
+        report = await create_final_report(session, user_id, run_id)
+        if report is None:
+            await session.rollback()
+            await _mark_failed(user_id, run_id, "The final report could not be saved.")
+            return
+        report_event = (
+            await bus.persist(
+                session,
+                user_id,
+                run_id,
+                event_type="artifact.created",
+                payload={"artifact_id": str(report.id), "kind": "report", "name": report.name},
+            )
+            if report is not None
+            else None
+        )
         state = await stage_transition(session, user_id, run, "COMPLETED", event_bus=bus)
         completed = await bus.persist(
             session, user_id, run_id, event_type="run.completed", payload={"status": "COMPLETED"}
@@ -125,11 +151,39 @@ async def _mark_completed(user_id: UUID, run_id: UUID) -> None:
         await session.commit()
         await session.refresh(state)
         events = [state]
+        if report_event is not None:
+            await session.refresh(report_event)
+            events.insert(0, report_event)
         if completed is not None:
             await session.refresh(completed)
             events.append(completed)
     await _publish_all(bus, events)
     await destroy_run_sandbox(run_id)
+
+
+def _workflow_task_description(role: str) -> str:
+    """Keep post-build agent tasks constrained to their M6/M7 responsibilities."""
+    instructions = {
+        "tester": (
+            "Run the project test suite in the sandbox. Use tester_report with the actual "
+            "command, exit code, and test counts, then finish with a concise result."
+        ),
+        "reviewer": (
+            "Review the completed project diff for correctness and security. Use "
+            "review_complete with a pass or fail and concrete findings, then finish."
+        ),
+        "deployer": (
+            "Deploy the tested application using the connected GitHub and Vercel integrations. "
+            "List integrations first, use only returned integration IDs, push or deploy only "
+            "through the approval gate, poll for success, and run http_check on the live HTTPS "
+            "URL. Report repository and live URLs. Never expose credentials."
+        ),
+        "reporter": (
+            "Summarize the idea, implementation, test results, approvals, cost, known issues, "
+            "repository URL, and live URL. Finish with a structured result."
+        ),
+    }
+    return instructions[role]
 
 
 class RunOrchestrator:
@@ -142,12 +196,34 @@ class RunOrchestrator:
 
     async def advance_until_input(self, user_id: UUID, run_id: UUID) -> str:
         """Advance at most through the current phase, stopping at a user gate."""
+        lock_key = int.from_bytes(sha256(run_id.bytes).digest()[:8], "big") & ((1 << 63) - 1)
+        async with engine.connect() as connection:
+            acquired = bool(
+                await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"), {"lock_key": lock_key}
+                )
+            )
+            if not acquired:
+                async with SessionFactory() as session:
+                    run = await RunRepository(session).get_for_user(user_id, run_id)
+                if run is None:
+                    raise LookupError("Run not found.")
+                return run.status
+            try:
+                return await self._advance_until_input_locked(user_id, run_id)
+            finally:
+                await connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"), {"lock_key": lock_key}
+                )
+
+    async def _advance_until_input_locked(self, user_id: UUID, run_id: UUID) -> str:
+        """Run one workflow while holding the per-run PostgreSQL advisory lock."""
         async with SessionFactory() as session:
             run = await RunRepository(session).get_for_user(user_id, run_id)
             keys = await ProviderKeyRepository(session).list_for_user(user_id)
         if run is None:
             raise LookupError("Run not found.")
-        if run.status == "EXECUTING":
+        if run.status in {"EXECUTING", "VERIFYING", "DEPLOYING", "REPORTING"}:
             return await self._advance_tasks(user_id, run_id)
         if run.status not in {"CREATED", "CLARIFYING", "PLANNING"}:
             return run.status
@@ -205,13 +281,18 @@ class RunOrchestrator:
         while True:
             async with SessionFactory() as session:
                 current = await RunRepository(session).get_for_user(user_id, run_id)
-                if current is None or current.status != "EXECUTING":
+                if current is None or current.status not in {
+                    "EXECUTING",
+                    "VERIFYING",
+                    "DEPLOYING",
+                    "REPORTING",
+                }:
                     return current.status if current is not None else "FAILED"
                 batch = await TaskRepository(session).claim_ready(user_id, run_id, 4)
                 if batch is None:
                     raise LookupError("Run not found.")
                 tasks, blocked_tasks, newly_claimed = batch
-                assignments: list[tuple[UUID, UUID, str, int]] = []
+                assignments: list[tuple[UUID, UUID, str, int, RoleTemplate]] = []
                 pending_events: list[Event | None] = []
                 for blocked_task in blocked_tasks:
                     blocked_event = await self._bus.persist(
@@ -227,28 +308,42 @@ class RunOrchestrator:
                     )
                     pending_events.append(blocked_event)
                 for task in tasks:
+                    task_role = str(task.input.get("system_role", "coder"))
+                    task_template = ROLE_TEMPLATES.get(task_role, template)
                     attempts = task.input.get("attempts", 0)
-                    attempt_count = attempts + 1 if isinstance(attempts, int) else 1
-                    task.input = {**task.input, "attempts": attempt_count}
+                    previous_attempts = attempts if isinstance(attempts, int) else 0
+                    if task.id in newly_claimed:
+                        attempt_count = previous_attempts + 1
+                        task.input = {**task.input, "attempts": attempt_count}
+                    else:
+                        attempt_count = max(1, previous_attempts)
                     config = {
-                        "name": template.name,
-                        "system_prompt": template.system_prompt,
-                        "model_tier": template.model_tier.value,
-                        "tool_allowlist": list(template.tool_allowlist),
-                        "output_schema": template.output_schema,
-                        "max_steps": template.max_steps,
-                        "max_cost_usd": template.max_cost_usd,
+                        "name": task_template.name,
+                        "system_prompt": task_template.system_prompt,
+                        "model_tier": task_template.model_tier.value,
+                        "tool_allowlist": list(task_template.tool_allowlist),
+                        "output_schema": task_template.output_schema,
+                        "max_steps": task_template.max_steps,
+                        "max_cost_usd": task_template.max_cost_usd,
                     }
                     agent_repo = AgentRepository(session)
                     agent = (
                         await agent_repo.get_for_id(user_id, task.agent_id)
-                        if task.agent_id is not None
+                        if task.agent_id is not None and attempt_count == 1
                         else None
                     )
                     is_new_agent = agent is None
                     if agent is None:
+                        agent_task_id = (
+                            task.id
+                            if attempt_count == 1
+                            else uuid5(
+                                NAMESPACE_URL,
+                                f"forge-task:{task.id}:attempt:{attempt_count}",
+                            )
+                        )
                         agent = await agent_repo.get_or_create_for_task(
-                            user_id, run_id, "coder", task.id, config
+                            user_id, run_id, task_role, agent_task_id, config
                         )
                     if agent is None:
                         raise LookupError("Run not found.")
@@ -294,7 +389,13 @@ class RunOrchestrator:
                         )
                         pending_events.append(task_event)
                     assignments.append(
-                        (task.id, agent.id, f"{task.title}: {task.description}", attempt_count)
+                        (
+                            task.id,
+                            agent.id,
+                            f"{task.title}: {task.description}",
+                            attempt_count,
+                            task_template,
+                        )
                     )
                 await session.commit()
                 committed_events = await _refresh_events(session, pending_events)
@@ -305,10 +406,89 @@ class RunOrchestrator:
                 if final_tasks is not None and all(
                     task.status == "completed" for task in final_tasks
                 ):
-                    await _mark_completed(user_id, run_id)
-                    return "COMPLETED"
-                if final_tasks and all(
-                    task.status in {"failed", "blocked", "interrupted"} for task in final_tasks
+                    completed_by_role = {
+                        str(task.input.get("system_role"))
+                        for task in final_tasks
+                        if task.input.get("system_role")
+                    }
+                    next_role = next(
+                        (
+                            role
+                            for role in ("tester", "reviewer", "deployer", "reporter")
+                            if role not in completed_by_role
+                        ),
+                        None,
+                    )
+                    if next_role is None:
+                        await _mark_completed(user_id, run_id)
+                        return "COMPLETED"
+                    phase_by_role = {
+                        "tester": "VERIFYING",
+                        "reviewer": "VERIFYING",
+                        "deployer": "DEPLOYING",
+                        "reporter": "REPORTING",
+                    }
+                    workflow_tasks = {
+                        str(task.input.get("system_role")): task
+                        for task in final_tasks
+                        if task.input.get("system_role")
+                    }
+                    if next_role == "tester":
+                        dependencies = [
+                            task.id for task in final_tasks if not task.input.get("system_role")
+                        ]
+                    else:
+                        prerequisite = {
+                            "reviewer": "tester",
+                            "deployer": "reviewer",
+                            "reporter": "deployer",
+                        }[next_role]
+                        prior_task = workflow_tasks.get(prerequisite)
+                        dependencies = [prior_task.id] if prior_task is not None else []
+                    async with SessionFactory() as session:
+                        current_run = await RunRepository(session).get_for_user(
+                            user_id, run_id, lock=True
+                        )
+                        if current_run is None:
+                            raise LookupError("Run not found.")
+                        target_phase = phase_by_role[next_role]
+                        state_event = None
+                        if current_run.status != target_phase:
+                            state_event = await stage_transition(
+                                session,
+                                user_id,
+                                current_run,
+                                target_phase,
+                                event_bus=self._bus,
+                                payload={"role": next_role},
+                            )
+                        role_task, created = await TaskRepository(session).ensure_workflow_task(
+                            user_id,
+                            run_id,
+                            next_role,
+                            _workflow_task_description(next_role),
+                            dependencies,
+                        )
+                        if role_task is None:
+                            raise LookupError("Run not found.")
+                        phase_event = (
+                            await self._bus.persist(
+                                session,
+                                user_id,
+                                run_id,
+                                event_type="run.phase_changed",
+                                payload={"phase": target_phase, "role": next_role},
+                            )
+                            if created
+                            else None
+                        )
+                        await session.commit()
+                        committed = await _refresh_events(session, [state_event, phase_event])
+                    await _publish_all(self._bus, committed)
+                    continue
+                remaining = [task for task in final_tasks or [] if task.status != "completed"]
+                if remaining and all(
+                    task.status in {"failed", "blocked", "interrupted"} for task in remaining
                 ):
                     await _mark_failed(
                         user_id, run_id, "All remaining tasks failed or were blocked."
@@ -326,9 +506,9 @@ class RunOrchestrator:
                         attempt,
                         provider,
                         provider_key_id,
-                        template,
+                        task_template,
                     )
-                    for task_id, agent_id, prompt, attempt in assignments
+                    for task_id, agent_id, prompt, attempt, task_template in assignments
                 )
             )
             if any(outcome == "paused" for outcome in outcomes):
@@ -378,6 +558,28 @@ class RunOrchestrator:
             result = TaskResult(status="failed", summary=str(error))
         except (LookupError, ValueError, LLMRequestError, ProviderKeyUnavailable) as error:
             result = TaskResult(status="failed", summary=str(error))
+        if result.status == "completed" and template.name in {
+            "tester",
+            "reviewer",
+            "deployer",
+        }:
+            async with SessionFactory() as session:
+                valid = False
+                if template.name == "tester":
+                    valid = await _tester_report_passed(session, user_id, run_id, agent_id)
+                elif template.name == "reviewer":
+                    valid = await _reviewer_passed(session, user_id, run_id, agent_id)
+                else:
+                    await _persist_delivery_links(session, user_id, run_id, agent_id, self._bus)
+                    valid = await _deployer_evidence(session, user_id, run_id, agent_id)
+                if not valid:
+                    result = TaskResult(
+                        status="failed",
+                        summary=(
+                            f"{template.name.title()} cannot complete without its required "
+                            "verified tool evidence."
+                        ),
+                    )
         status_value: Literal[
             "completed",
             "failed",
@@ -401,6 +603,11 @@ class RunOrchestrator:
             agent = await AgentRepository(session).get_for_id(user_id, agent_id)
             if task is None or agent is None:
                 raise LookupError("Task or agent not found.")
+            delivery_event = (
+                await _persist_delivery_links(session, user_id, run_id, agent_id, self._bus)
+                if status_value == "completed" and task.external_id == "__m8_deployer__"
+                else None
+            )
             if status_value in {"completed", "failed", "interrupted"}:
                 agent.status = (
                     "completed"
@@ -429,7 +636,7 @@ class RunOrchestrator:
                 payload={"agent_id": str(agent.id), "status": agent.status},
             )
             await session.commit()
-            events = await _refresh_events(session, [task_event, status_event])
+            events = await _refresh_events(session, [delivery_event, task_event, status_event])
         await _publish_all(self._bus, events)
         return "suspended" if result.status == "waiting_approval" else status_value
 
@@ -632,6 +839,109 @@ class RunOrchestrator:
             await session.commit()
             events = await _refresh_events(session, pending)
         await _publish_all(bus, events)
+
+
+async def _persist_delivery_links(
+    session: AsyncSession, user_id: UUID, run_id: UUID, agent_id: UUID, bus: EventBus
+) -> Event | None:
+    """Copy only validated public delivery URLs from safe adapter outputs to the project."""
+    run = await RunRepository(session).get_for_user(user_id, run_id)
+    if run is None:
+        return None
+    executions = await session.scalars(
+        select(ToolExecution)
+        .join(Run, Run.id == ToolExecution.run_id)
+        .where(
+            Run.user_id == user_id,
+            ToolExecution.run_id == run_id,
+            ToolExecution.agent_id == agent_id,
+            ToolExecution.status == "completed",
+        )
+        .order_by(ToolExecution.completed_at, ToolExecution.created_at, ToolExecution.id)
+    )
+    repo_url: str | None = None
+    live_url: str | None = None
+    for execution in executions.all():
+        output = execution.output_payload or {}
+        raw_url = output.get("html_url") if execution.tool_name.startswith("github_") else None
+        if execution.tool_name == "vercel_deployment_url":
+            raw_url = output.get("url")
+        if not isinstance(raw_url, str):
+            continue
+        parsed = urlsplit(raw_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            continue
+        if execution.tool_name.startswith("github_") and parsed.hostname.lower() == "github.com":
+            repo_url = raw_url
+        if execution.tool_name == "vercel_deployment_url":
+            live_url = raw_url
+    if repo_url is None and live_url is None:
+        return None
+    project = await ProjectRepository(session).update_delivery_links(
+        user_id, run.project_id, repo_url=repo_url, live_url=live_url
+    )
+    if project is None:
+        return None
+    return await bus.persist(
+        session,
+        user_id,
+        run_id,
+        event_type="project.delivery_updated",
+        payload={"repo_url": repo_url, "live_url": live_url},
+    )
+
+
+async def _deployer_evidence(
+    session: AsyncSession, user_id: UUID, run_id: UUID, agent_id: UUID
+) -> bool:
+    """Require a ready deployment, its public URL, and a passing HTTP smoke check."""
+    executions = await session.scalars(
+        select(ToolExecution)
+        .join(Run, Run.id == ToolExecution.run_id)
+        .where(
+            Run.user_id == user_id,
+            ToolExecution.run_id == run_id,
+            ToolExecution.agent_id == agent_id,
+            ToolExecution.status == "completed",
+        )
+        .order_by(ToolExecution.completed_at, ToolExecution.created_at, ToolExecution.id)
+    )
+    records = list(executions.all())
+    outputs = {execution.tool_name: execution.output_payload or {} for execution in records}
+    status = outputs.get("vercel_deployment_status", {})
+    url = outputs.get("vercel_deployment_url", {})
+    check = outputs.get("http_check", {})
+    url_execution = next(
+        (item for item in reversed(records) if item.tool_name == "vercel_deployment_url"), None
+    )
+    check_execution = next(
+        (item for item in reversed(records) if item.tool_name == "http_check"), None
+    )
+    run = await session.scalar(select(Run).where(Run.id == run_id, Run.user_id == user_id))
+    project = (
+        await session.scalar(
+            select(Project).where(Project.id == run.project_id, Project.user_id == user_id)
+        )
+        if run is not None
+        else None
+    )
+    raw_url = url.get("url")
+    parsed = urlsplit(raw_url) if isinstance(raw_url, str) else None
+    return (
+        "vercel_deploy" in outputs
+        and status.get("readyState") == "READY"
+        and parsed is not None
+        and parsed.scheme == "https"
+        and parsed.hostname is not None
+        and check_execution is not None
+        and check_execution.input_payload.get("url") == raw_url
+        and check.get("ok") is True
+        and check.get("status_code") == 200
+        and project is not None
+        and bool(project.repo_url)
+        and project.live_url == raw_url
+        and url_execution is not None
+    )
 
 
 async def _complete_agent(

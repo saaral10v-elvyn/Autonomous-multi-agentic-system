@@ -27,6 +27,7 @@ class RunCreateRequest(BaseModel):
     idea: Annotated[str, Field(min_length=1, max_length=20_000)]
     autonomy_level: AutonomyLevel
     budget_usd: Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=2)]
+    project_id: UUID | None = None
 
     @field_validator("idea")
     @classmethod
@@ -49,6 +50,23 @@ class RunResponse(BaseModel):
     status: str
     budget_usd: Decimal
     spent_usd: Decimal
+    created_at: datetime
+
+
+class ProjectResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    repo_url: str | None
+    live_url: str | None
+    created_at: datetime
+
+
+class ReportResponse(BaseModel):
+    id: UUID
+    run_id: UUID
+    markdown: str
     created_at: datetime
 
 

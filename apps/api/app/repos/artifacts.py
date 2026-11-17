@@ -63,3 +63,37 @@ class ArtifactRepository:
         self._session.add(artifact)
         await self._session.flush()
         return artifact, True
+
+    async def report_for_run(self, user_id: UUID, run_id: UUID) -> Artifact | None:
+        return await self._session.scalar(
+            select(Artifact)
+            .join(Run, Run.id == Artifact.run_id)
+            .where(
+                Run.user_id == user_id,
+                Run.id == run_id,
+                Artifact.kind == "report",
+            )
+            .order_by(Artifact.created_at.desc())
+            .limit(1)
+        )
+
+    async def save_report(self, user_id: UUID, run_id: UUID, markdown: str) -> Artifact | None:
+        run_exists = await self._session.scalar(
+            select(Run.id).where(Run.id == run_id, Run.user_id == user_id)
+        )
+        if run_exists is None:
+            return None
+        artifact = await self.report_for_run(user_id, run_id)
+        if artifact is None:
+            artifact = Artifact(
+                run_id=run_id,
+                kind="report",
+                name="Final report",
+                uri=f"run://{run_id}/report.md",
+                meta={"markdown": markdown},
+            )
+            self._session.add(artifact)
+        else:
+            artifact.meta = {"markdown": markdown}
+        await self._session.flush()
+        return artifact

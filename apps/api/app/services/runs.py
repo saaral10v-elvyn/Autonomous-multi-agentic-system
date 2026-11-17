@@ -9,6 +9,7 @@ from app.events.bus import EventBus
 from app.models.run import Run
 from app.repos.projects import ProjectRepository
 from app.repos.runs import RunRepository
+from app.repos.tasks import TaskRepository
 
 
 def _project_name(idea: str) -> str:
@@ -35,21 +36,55 @@ class RunService:
         idea: str,
         autonomy_level: str,
         budget_usd: Decimal,
+        project_id: UUID | None = None,
     ) -> Run:
-        project = await self._projects.create_for_user(user_id, name=_project_name(idea))
-        run = await self._runs.create_for_user(
-            user_id,
-            project_id=project.id,
-            idea=idea.strip(),
-            autonomy_level=autonomy_level,
-            budget_usd=budget_usd,
-        )
+        final_idea = idea.strip()
+        run: Run | None
+        if project_id is None:
+            project = await self._projects.create_for_user(user_id, name=_project_name(final_idea))
+            run = await self._runs.create_for_user(
+                user_id,
+                project_id=project.id,
+                idea=final_idea,
+                autonomy_level=autonomy_level,
+                budget_usd=budget_usd,
+            )
+        else:
+            existing_project = await self._projects.get_for_user(user_id, project_id)
+            if existing_project is None:
+                raise LookupError("Project not found.")
+            previous_runs = await self._projects.runs_for_user(user_id, project_id)
+            context_lines: list[str] = []
+            if previous_runs:
+                previous = previous_runs[0]
+                previous_idea = previous.idea.split("\n\nPrior project context:")[0][:1200]
+                context_lines.append(f"Previous run idea: {previous_idea}")
+                task_rows = await TaskRepository(self._session).list_for_run(user_id, previous.id)
+                for task in (task_rows or [])[:8]:
+                    summary = task.output.get("summary") if task.output else None
+                    if isinstance(summary, str):
+                        context_lines.append(f"{task.title}: {summary[:500]}")
+                if existing_project.repo_url:
+                    context_lines.append(f"Existing repository: {existing_project.repo_url}")
+            if context_lines:
+                final_idea = (
+                    final_idea[:10_000] + "\n\nPrior project context:\n" + "\n".join(context_lines)
+                )[:20_000]
+            run = await self._projects.create_run_for_user(
+                user_id,
+                project_id,
+                idea=final_idea,
+                autonomy_level=autonomy_level,
+                budget_usd=budget_usd,
+            )
+            if run is None:
+                raise LookupError("Project not found.")
         event = await self._event_bus.persist(
             self._session,
             user_id,
             run.id,
             event_type="run.state_changed",
-            payload={"status": "CREATED", "project_id": str(project.id)},
+            payload={"status": "CREATED", "project_id": str(run.project_id)},
         )
         if event is None:
             raise RuntimeError("New run could not be scoped for event creation.")

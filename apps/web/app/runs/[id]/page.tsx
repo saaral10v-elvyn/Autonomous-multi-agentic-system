@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import {
   api,
@@ -15,6 +15,7 @@ import {
   type RunEvent,
   type RunQuestion,
   type RunTask,
+  type RunReport,
 } from "@/lib/api";
 import { useRunStream } from "@/hooks/use-run-stream";
 import { SandboxPanel } from "./sandbox-panel";
@@ -53,8 +54,13 @@ function eventPlan(events: RunEvent[]): Plan | null {
 export default function RunPage() {
   const params = useParams<{ id: string }>();
   const runId = params.id;
+  const router = useRouter();
   const { events, connected } = useRunStream(runId);
   const [run, setRun] = useState<Run | null>(null);
+  const state = [...events].reverse().find((event) => event.type === "run.state_changed")?.payload.status;
+  const status = typeof state === "string" ? state : run?.status ?? "Loading";
+  const latestPhase = [...events].reverse().find((event) => event.type === "run.phase_changed");
+  const phase = typeof latestPhase?.payload.phase === "string" ? latestPhase.payload.phase : status;
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [editedPayloads, setEditedPayloads] = useState<Record<string, string>>({});
@@ -66,6 +72,7 @@ export default function RunPage() {
   const [tasks, setTasks] = useState<RunTask[]>([]);
   const [message, setMessage] = useState("");
   const [targetAgent, setTargetAgent] = useState("");
+  const [report, setReport] = useState<RunReport | null>(null);
 
   useEffect(() => {
     void api.run(runId).then(setRun).catch((reason: unknown) =>
@@ -78,6 +85,12 @@ export default function RunPage() {
       setError(reason instanceof Error ? reason.message : "Could not load approvals."),
     );
   }, [runId, events]);
+
+  useEffect(() => {
+    if (status === "COMPLETED") {
+      void api.runReport(runId).then(setReport).catch(() => setReport(null));
+    }
+  }, [status, runId, events]);
 
   useEffect(() => {
     void api.integrations().then(setIntegrations).catch(() => setIntegrations([]));
@@ -102,8 +115,6 @@ export default function RunPage() {
     }
   }, [events, run]);
 
-  const state = [...events].reverse().find((event) => event.type === "run.state_changed")?.payload.status;
-  const status = typeof state === "string" ? state : run?.status ?? "Loading";
   const questionEvent = [...events].reverse().find((event) => event.type === "question.asked");
   const rawQuestions = questionEvent?.payload.questions;
   const questions = Array.isArray(rawQuestions) ? rawQuestions.filter(isQuestion) : [];
@@ -221,6 +232,47 @@ export default function RunPage() {
     }
   }
 
+  async function retryTask(task: RunTask) {
+    setSaving(true);
+    setError("");
+    try {
+      setRun(await api.retryTask(runId, task.id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not retry task.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function iterateProject() {
+    if (!run) return;
+    setSaving(true);
+    setError("");
+    try {
+      const next = await api.createRun(
+        `Continue iterating on this project: ${run.idea.split("\n\nPrior project context:")[0]}`,
+        run.autonomy_level,
+        Number(run.budget_usd),
+        run.project_id,
+      );
+      router.push(`/runs/${next.id}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not start an iteration.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function downloadReport() {
+    if (!report) return;
+    const url = URL.createObjectURL(new Blob([report.markdown], { type: "text/markdown;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "run-report.md";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   const costEvent = [...events].reverse().find((event) => event.type === "cost.updated");
   const spent = typeof costEvent?.payload.run_spent_usd === "string"
     ? costEvent.payload.run_spent_usd : "0";
@@ -231,9 +283,11 @@ export default function RunPage() {
     {run ? <>
       <header className="space-y-2">
         <p className="text-sm text-slate-500">{connected ? "Live" : "Reconnecting"} · <span aria-label="Run state">{status}</span></p>
+        <p aria-label="Run phase" className="text-sm text-slate-600">Stage: {phase}</p>
         <h1 className="text-3xl font-semibold">{run.idea}</h1>
         <p>Budget cap: ${run.budget_usd}</p>
         <p aria-label="Run cost">Spent: ${spent} / ${run.budget_usd}</p>
+        {status === "COMPLETED" && <button disabled={saving} onClick={() => void iterateProject()} className="rounded border px-3 py-2">Iterate on this project</button>}
         <div className="flex flex-wrap gap-2">
           {status === "PAUSED" ? <button
             disabled={saving}
@@ -365,6 +419,7 @@ export default function RunPage() {
         >
           {tasks.map((task) => <li key={task.id} className="rounded border p-3">
             <span className="font-medium">{task.title}</span> · {task.status}
+            {status === "FAILED" && ["failed", "blocked", "interrupted"].includes(task.status) && <button disabled={saving} onClick={() => void retryTask(task)} className="ml-3 rounded border px-2 py-1">Retry from this step</button>}
             {task.depends_on.length > 0 && <p className="text-sm text-slate-600">
               Depends on: {task.depends_on.join(", ")}
             </p>}
@@ -395,6 +450,10 @@ export default function RunPage() {
           >Send message</button>
         </form>
       </section>
+      {report && <section aria-label="Final report" className="space-y-3 rounded-xl border p-5">
+        <div className="flex items-center justify-between gap-3"><h2 className="text-xl font-medium">Final report</h2><button onClick={() => void downloadReport()} className="rounded border px-3 py-2">Download Markdown</button></div>
+        <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap rounded bg-slate-50 p-4 text-sm">{report.markdown}</pre>
+      </section>}
       <section className="space-y-3">
         <SandboxPanel runId={runId} events={events} />
       </section>
